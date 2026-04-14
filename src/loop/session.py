@@ -22,7 +22,6 @@ Termination reasons and how the main loop interprets them:
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -43,21 +42,12 @@ from ..models import (
 )
 from ..tools import ToolExecutor, WORKER_TOOL_SCHEMAS, format_tool_result_for_llm, format_tool_call_for_transcript
 from ..workspace import Workspace
+from .turn_guard import TurnGuard
 
 if TYPE_CHECKING:
     from ..audit import AuditLogger
 
 log = logging.getLogger(__name__)
-
-# Error message fragments that indicate an LLM context-length rejection
-_CONTEXT_OVERFLOW_PATTERNS = [
-    "context_length_exceeded",
-    "maximum context length",
-    "too many tokens",
-    "reduce the length",
-    "context window",
-    "token limit",
-]
 
 
 class WorkerSession:
@@ -91,6 +81,7 @@ class WorkerSession:
         self._prev_summary = previous_summary
         self._audit = audit
         self._executor = ToolExecutor(config)
+        self._guard = TurnGuard(llm=self._llm)
 
         # Conversation state
         self._messages: list[dict[str, Any]] = []
@@ -119,48 +110,21 @@ class WorkerSession:
                 session_id=self._session_id,
                 goal_id=self._goal.goal_id,
             )
-            try:
-                response = self._llm.chat(
-                    messages=self._messages,
-                    tools=WORKER_TOOL_SCHEMAS,
-                    tool_choice="required",
-                    temperature=0.3,
-                )
-            except Exception as exc:
-                exc_str = str(exc).lower()
-                if any(p in exc_str for p in _CONTEXT_OVERFLOW_PATTERNS):
-                    log.warning("LLM context overflow at tick %d: %s", tick_id, exc)
-                    return self._end_session(
-                        tick_id=tick_id,
-                        status="context_overflow",
-                        summary=(
-                            f"Context overflow at action {self._action_count}. "
-                            f"Try compressing earlier (lower context_compress_threshold_tokens "
-                            f"or reduce max_read_chars)."
-                        ),
-                    )
-                log.error("Worker LLM call failed at tick %d: %s", tick_id, exc)
+            turn = self._guard.call(
+                self._messages, WORKER_TOOL_SCHEMAS, temperature=0.3
+            )
+            self._messages.extend(turn.history_prefix)
+
+            if turn.abort:
+                status = "context_overflow" if turn.context_overflow else "stuck"
                 return self._end_session(
                     tick_id=tick_id,
-                    status="error",
-                    summary=f"LLM call failed: {exc}",
+                    status=status,
+                    summary=turn.abort_reason,
                 )
-
-            # Handle tool calls
-            if not response.tool_calls:
-                # No tool call — treat as stuck
-                log.warning("Worker produced no tool calls at tick %d", tick_id)
-                return self._end_session(
-                    tick_id=tick_id,
-                    status="stuck",
-                    summary="No tool calls returned — model may be confused.",
-                )
-
-            # Append assistant message
-            self._messages.append(_build_assistant_msg(response))
 
             # Process each tool call
-            for tc in response.tool_calls:
+            for tc in turn.tool_calls:
                 self._action_count += 1
 
                 # finish() is special — end the session
@@ -210,7 +174,7 @@ class WorkerSession:
                 self._log_tick(
                     tick_id=tick_id,
                     action_type=tc.name,
-                    summary=f"{tc.name}({_args_preview(tc.arguments)}) → {result.output[:80]}",
+                    summary=f"{tc.name}({_args_preview(tc.arguments)}) \u2192 {result.output[:80]}",
                     outcome=outcome,
                 )
                 self._transcript_entries.append(
@@ -255,6 +219,8 @@ class WorkerSession:
                         ),
                     )
 
+            self._messages.extend(turn.history_suffix)
+
     # ── Initialisation ─────────────────────────────────────────────────────
 
     def _init_messages(self) -> None:
@@ -292,7 +258,7 @@ class WorkerSession:
             return
 
         log.info(
-            "Worker context at ~%d tokens (threshold %d) — compressing",
+            "Worker context at ~%d tokens (threshold %d) \u2014 compressing",
             estimated_tokens, threshold,
         )
 
@@ -323,7 +289,7 @@ class WorkerSession:
         compressed_msg: dict[str, Any] = {
             "role": "user",
             "content": (
-                f"[Context compressed — earlier actions summarised]\n\n"
+                f"[Context compressed \u2014 earlier actions summarised]\n\n"
                 f"{summary_text}"
             ),
         }
@@ -331,7 +297,7 @@ class WorkerSession:
         self._messages = (
             self._messages[:keep_start] + [compressed_msg] + tail
         )
-        log.info("Context compressed: %d → %d messages", len(to_compress), 1)
+        log.info("Context compressed: %d \u2192 %d messages", len(to_compress), 1)
 
     # ── Session finalisation ───────────────────────────────────────────────
 
@@ -381,29 +347,9 @@ class WorkerSession:
             log.error("Failed to log tick %d: %s", tick_id, exc)
 
 
-# ── Message formatting helpers ─────────────────────────────────────────────
-
-def _build_assistant_msg(response) -> dict[str, Any]:
-    tool_calls_raw = []
-    for tc in response.tool_calls:
-        tool_calls_raw.append({
-            "id": tc.call_id,
-            "type": "function",
-            "function": {
-                "name": tc.name,
-                "arguments": json.dumps(tc.arguments),
-            },
-        })
-    return {
-        "role": "assistant",
-        "content": response.content or None,
-        "tool_calls": tool_calls_raw,
-    }
-
-
 def _args_preview(args: dict) -> str:
     parts = []
     for k, v in list(args.items())[:2]:
-        v_str = str(v)[:40].replace("\n", "↵")
+        v_str = str(v)[:40].replace("\n", "\u21b5")
         parts.append(f"{k}={v_str!r}")
     return ", ".join(parts)

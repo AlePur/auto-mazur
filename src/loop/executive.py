@@ -38,6 +38,7 @@ from ..models import (
     TickRecord,
 )
 from ..workspace import Workspace
+from .turn_guard import TurnGuard, TurnPolicy
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ class ExecutiveTick:
         self._llm = llm
         self._db = db
         self._workspace = workspace
+        self._guard = TurnGuard(
+            llm=self._llm,
+            policy=TurnPolicy(max_no_tool_retries=1),
+        )
 
     def run(
         self,
@@ -89,27 +94,25 @@ class ExecutiveTick:
         # ── Query / decision loop ──────────────────────────────────────────
         while True:
             self._llm.set_call_context(actor=ACTOR_EXECUTIVE, tick_id=current_tick)
-            try:
-                response = self._llm.chat(
-                    messages=messages,
-                    tools=exec_char.ALL_TOOL_SCHEMAS,
-                    tool_choice="required",
-                    temperature=0.5,
-                )
-            except Exception as exc:
-                log.error("Executive LLM call failed at tick %d: %s", current_tick, exc)
-                self._log_tick(current_tick, f"LLM call failed: {exc}", OUTCOME_ERROR)
-                return []
+            turn = self._guard.call(
+                messages,
+                exec_char.ALL_TOOL_SCHEMAS,
+                tool_choice="required",
+                temperature=0.5,
+            )
+            messages.extend(turn.history_prefix)
 
-            if not response.tool_calls:
-                log.warning("Executive returned no tool calls at tick %d", current_tick)
-                self._log_tick(current_tick, "no tool calls returned", OUTCOME_ERROR)
+            if turn.abort:
+                log.error(
+                    "Executive tick %d aborted: %s", current_tick, turn.abort_reason
+                )
+                self._log_tick(current_tick, turn.abort_reason[:200], OUTCOME_ERROR)
                 return []
 
             # Classify tool calls
-            query_calls = [tc for tc in response.tool_calls
+            query_calls = [tc for tc in turn.tool_calls
                            if tc.name in exec_char.EXEC_QUERY_TOOLS]
-            action_calls = [tc for tc in response.tool_calls
+            action_calls = [tc for tc in turn.tool_calls
                             if tc.name not in exec_char.EXEC_QUERY_TOOLS]
 
             # If any action tools were called, extract and return them
@@ -167,18 +170,17 @@ class ExecutiveTick:
                     return []
 
             # Execute query tools and append results to conversation
-            assistant_msg = _build_assistant_msg(response)
-            messages.append(assistant_msg)
-
             for tc in query_calls:
                 query_count += 1
                 result_text = self._execute_query(tc.name, tc.arguments)
-                log.debug("Executive query %r → %d chars", tc.name, len(result_text))
+                log.debug("Executive query %r \u2192 %d chars", tc.name, len(result_text))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.call_id,
                     "content": result_text,
                 })
+
+            messages.extend(turn.history_suffix)
 
     # ── Query tool execution ───────────────────────────────────────────────
 
@@ -216,7 +218,7 @@ class ExecutiveTick:
                 for e in entries:
                     content = self._workspace.read_journal_file(e["file_path"]) or "(unreadable)"
                     parts.append(
-                        f"### Ticks {e['tick_start']}–{e['tick_end']}\n{content}"
+                        f"### Ticks {e['tick_start']}\u2013{e['tick_end']}\n{content}"
                     )
                 return "\n\n---\n\n".join(parts)
 
@@ -246,7 +248,7 @@ class ExecutiveTick:
                     lines.append(
                         f"- session {s['session_id']} "
                         f"[{s.get('status', '?')}] "
-                        f"ticks {s['tick_start']}–{s.get('tick_end', '?')}: "
+                        f"ticks {s['tick_start']}\u2013{s.get('tick_end', '?')}: "
                         f"{(s.get('summary') or '(no summary)')[:120]}"
                     )
                 return "\n".join(lines)
@@ -282,26 +284,6 @@ class ExecutiveTick:
             ))
         except Exception as exc:
             log.error("Failed to log Executive tick %d: %s", tick_id, exc)
-
-
-def _build_assistant_msg(response) -> dict[str, Any]:
-    """Build an OpenAI-format assistant message with tool_calls."""
-    import json
-    tool_calls_raw = []
-    for tc in response.tool_calls:
-        tool_calls_raw.append({
-            "id": tc.call_id,
-            "type": "function",
-            "function": {
-                "name": tc.name,
-                "arguments": json.dumps(tc.arguments),
-            },
-        })
-    return {
-        "role": "assistant",
-        "content": response.content or None,
-        "tool_calls": tool_calls_raw,
-    }
 
 
 def _params_preview(params: dict) -> str:
