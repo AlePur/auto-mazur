@@ -27,7 +27,6 @@ def _setup_logging(verbose: bool) -> None:
         stream=sys.stdout,
     )
     # Quiet noisy third-party loggers
-    logging.getLogger("openai").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 

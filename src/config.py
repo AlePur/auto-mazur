@@ -2,14 +2,16 @@
 Configuration loading and validation.
 
 All tunables live in config.yaml. Environment variables prefixed with
-MAZUR_ override any value: MAZUR_MODEL, MAZUR_API_BASE, MAZUR_API_KEY, etc.
-The api_key itself is read from the env var named by `api_key_env`.
+MAZUR_ override any value: MAZUR_MODEL, MAZUR_API_BASE, MAZUR_MAX_RETRIES, etc.
+
+No API key is required: the vLLM server on Tailscale is accessed without
+authentication (local-network only, no public exposure).
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import yaml
@@ -21,9 +23,8 @@ _MIN_CONTEXT_LENGTH_TOKENS = 100_000
 @dataclass
 class Config:
     # ── LLM ───────────────────────────────────────────────────────────────
-    model: str = "gpt-4o"
-    api_base: str = "https://api.openai.com/v1"
-    api_key_env: str = "OPENAI_API_KEY"
+    model: str = "google/gemma-4-31B-it"
+    api_base: str = "http://localhost:8000/v1"
     max_retries: int = 3
 
     # ── Context window ────────────────────────────────────────────────────
@@ -65,20 +66,6 @@ class Config:
     failure_streak_threshold: int = 10
     neglect_threshold_ticks: int = 5_000
 
-    # ── Derived (set after loading) ───────────────────────────────────────
-    api_key: str = field(default="", repr=False)
-
-    # ------------------------------------------------------------------
-    def resolve_api_key(self) -> None:
-        """Read the actual API key from the environment."""
-        key = os.environ.get(self.api_key_env, "")
-        if not key:
-            raise EnvironmentError(
-                f"API key env var '{self.api_key_env}' is not set. "
-                "Export it before running the agent."
-            )
-        self.api_key = key
-
     def effective_compress_threshold(self) -> int:
         """
         Return the effective compression threshold.
@@ -100,8 +87,8 @@ class Config:
 
 def load_config(path: str | Path = "config.yaml") -> Config:
     """
-    Load config from YAML file, then apply MAZUR_* env var overrides.
-    Finally resolves the API key and validates critical constraints.
+    Load config from YAML file, then apply MAZUR_* env var overrides
+    and validate critical constraints.
     """
     cfg = Config()
 
@@ -112,7 +99,6 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         _apply_dict(cfg, data)
 
     _apply_env_overrides(cfg)
-    cfg.resolve_api_key()
     _validate(cfg)
     return cfg
 

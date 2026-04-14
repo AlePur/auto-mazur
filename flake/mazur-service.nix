@@ -14,10 +14,9 @@ let
     # change flake/flake.nix instead and redeploy)
 
     # LLM endpoint — vLLM on the GPU machine, reached over Tailscale.
-    # No authentication: vLLM is local-network only and the key is ignored.
+    # No authentication required: vLLM is reachable only via Tailscale.
     model:       "${cfg.model}"
     api_base:    "${cfg.vllmUrl}/v1"
-    api_key_env: "MAZUR_API_KEY"   # set to EMPTY in the systemd environment
     max_retries: 3
 
     # Context window must be >= 100 000 tokens.
@@ -162,9 +161,6 @@ in {
 
         Environment = [
           "HOME=/home/mazur"
-          # vLLM on Tailscale does not require authentication; the OpenAI
-          # client library still needs *some* non-empty string as the key.
-          "MAZUR_API_KEY=EMPTY"
         ];
 
         # Auto-restart so the agent cannot permanently shut itself down.

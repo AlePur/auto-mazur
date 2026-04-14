@@ -28,6 +28,7 @@ nohup vllm serve LilaRest/gemma-4-31B-it-NVFP4-turbo \
   --tool-call-parser gemma4 \
   --reasoning-parser gemma4 \
   --chat-template tool_chat_template_gemma4.jinja \
+  --default-chat-template-kwargs '{"enable_thinking": true}' \
   --host localhost \
   --port 8000 \
   --trust-remote-code &

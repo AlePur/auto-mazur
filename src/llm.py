@@ -1,5 +1,5 @@
 """
-LLM client — thin wrapper around the OpenAI-compatible chat completions API.
+LLM client — thin wrapper around the vLLM OpenAI-compatible chat completions API.
 
 Responsibilities:
   - Retry with exponential backoff on transient errors
@@ -7,8 +7,13 @@ Responsibilities:
   - Rough token counting for context-budget tracking
   - No prompt logic lives here; that belongs to characters/
 
-Supports any OpenAI-compatible endpoint: OpenAI, Azure, Ollama, vLLM, etc.
-Set config.api_base and config.model accordingly.
+Uses httpx directly (no openai SDK) so there is no third-party OpenAI dependency.
+Set config.api_base and config.model to point at the vLLM server on Tailscale.
+
+Thinking/reasoning (Gemma 4):
+  - Every request includes chat_template_kwargs: {enable_thinking: true}.
+  - The model's reasoning chain is produced internally and improves output quality,
+    but the reasoning tokens are discarded — only content is returned.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ import logging
 import time
 from typing import Any
 
-import openai
+import httpx
 
 from .config import Config
 from .models import LLMResponse, ToolCall, Usage
@@ -29,16 +34,21 @@ log = logging.getLogger(__name__)
 # Used for budget tracking when the API doesn't return usage.
 _CHARS_PER_TOKEN = 4
 
+# HTTP status codes that are retried (rate-limit and server errors).
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
 
 class LLMClient:
     def __init__(self, config: Config) -> None:
         self._cfg = config
-        self._client = openai.OpenAI(
-            api_key=config.api_key,
+        self._http = httpx.Client(
             base_url=config.api_base,
+            headers={"Content-Type": "application/json"},
+            # Generous timeout: vLLM may take a while for long reasoning chains.
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
         )
 
-    # ── Main interface ─────────────────────────────────────────────────────
+    # ── Main interface ─────────────────────────────────────────────────────────
 
     def chat(
         self,
@@ -51,19 +61,23 @@ class LLMClient:
         Send a chat completion request.
 
         - Retries up to config.max_retries on rate-limit / server errors.
+        - Thinking mode is always enabled (chat_template_kwargs).
         - tool_choice: "auto" | "none" | {"type": "function", "function": {"name": "..."}}
           Defaults to "auto" when tools are provided, otherwise omitted.
         """
-        kwargs: dict[str, Any] = {
+        body: dict[str, Any] = {
             "model": self._cfg.model,
             "messages": messages,
             "temperature": temperature,
+            # Always enable Gemma 4 structured thinking.  The reasoning chain
+            # improves answer quality; we discard the tokens, keep only content.
+            "chat_template_kwargs": {"enable_thinking": True},
         }
         if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice or "auto"
+            body["tools"] = tools
+            body["tool_choice"] = tool_choice or "auto"
 
-        raw = self._call_with_retry(**kwargs)
+        raw = self._call_with_retry(body)
         return self._parse_response(raw)
 
     def chat_json(
@@ -75,13 +89,14 @@ class LLMClient:
         Like chat() but instructs the model to return valid JSON and
         parses the response.  Used for structured output (Reflector, etc.)
         """
-        kwargs: dict[str, Any] = {
+        body: dict[str, Any] = {
             "model": self._cfg.model,
             "messages": messages,
             "temperature": temperature,
             "response_format": {"type": "json_object"},
+            "chat_template_kwargs": {"enable_thinking": True},
         }
-        raw = self._call_with_retry(**kwargs)
+        raw = self._call_with_retry(body)
         resp = self._parse_response(raw)
         text = resp.content or "{}"
         try:
@@ -106,66 +121,81 @@ class LLMClient:
 
     # ── Internal ───────────────────────────────────────────────────────────
 
-    def _call_with_retry(self, **kwargs) -> Any:
+    def _call_with_retry(self, body: dict[str, Any]) -> dict[str, Any]:
         last_exc: Exception | None = None
         for attempt in range(self._cfg.max_retries):
             try:
-                return self._client.chat.completions.create(**kwargs)
-            except openai.RateLimitError as exc:
-                wait = 2 ** attempt
-                log.warning("Rate limit hit (attempt %d/%d) — waiting %ds",
-                            attempt + 1, self._cfg.max_retries, wait)
-                time.sleep(wait)
-                last_exc = exc
-            except openai.APIStatusError as exc:
-                if exc.status_code >= 500:
+                response = self._http.post("/chat/completions", json=body)
+                if response.status_code in _RETRYABLE_STATUS:
                     wait = 2 ** attempt
-                    log.warning("Server error %d (attempt %d/%d) — waiting %ds",
-                                exc.status_code, attempt + 1, self._cfg.max_retries, wait)
+                    log.warning(
+                        "HTTP %d (attempt %d/%d) — waiting %ds",
+                        response.status_code, attempt + 1, self._cfg.max_retries, wait,
+                    )
                     time.sleep(wait)
-                    last_exc = exc
-                else:
-                    raise  # 4xx are not retried
-            except openai.APIConnectionError as exc:
+                    last_exc = httpx.HTTPStatusError(
+                        f"HTTP {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+                    continue
+                response.raise_for_status()  # raise on any remaining 4xx
+                return response.json()
+            except httpx.ConnectError as exc:
                 wait = 2 ** attempt
-                log.warning("Connection error (attempt %d/%d) — waiting %ds",
-                            attempt + 1, self._cfg.max_retries, wait)
+                log.warning(
+                    "Connection error (attempt %d/%d) — waiting %ds: %s",
+                    attempt + 1, self._cfg.max_retries, wait, exc,
+                )
                 time.sleep(wait)
                 last_exc = exc
+            except httpx.TimeoutException as exc:
+                wait = 2 ** attempt
+                log.warning(
+                    "Timeout (attempt %d/%d) — waiting %ds",
+                    attempt + 1, self._cfg.max_retries, wait,
+                )
+                time.sleep(wait)
+                last_exc = exc
+            except httpx.HTTPStatusError:
+                raise  # 4xx are not retried
         raise last_exc or RuntimeError("LLM call failed after all retries")
 
-    def _parse_response(self, raw: Any) -> LLMResponse:
-        choice = raw.choices[0]
-        msg = choice.message
+    def _parse_response(self, raw: dict[str, Any]) -> LLMResponse:
+        choice = raw["choices"][0]
+        msg = choice["message"]
 
         # Tool calls
         tool_calls: list[ToolCall] = []
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {"_raw": tc.function.arguments}
-                tool_calls.append(ToolCall(
-                    call_id=tc.id,
-                    name=tc.function.name,
-                    arguments=args,
-                ))
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {"_raw": fn.get("arguments")}
+            tool_calls.append(ToolCall(
+                call_id=tc.get("id", ""),
+                name=fn.get("name", ""),
+                arguments=args,
+            ))
 
         # Usage
-        if raw.usage:
+        usage_data = raw.get("usage")
+        if usage_data:
             usage = Usage(
-                prompt_tokens=raw.usage.prompt_tokens,
-                completion_tokens=raw.usage.completion_tokens,
-                total_tokens=raw.usage.total_tokens,
+                prompt_tokens=usage_data.get("prompt_tokens", 0),
+                completion_tokens=usage_data.get("completion_tokens", 0),
+                total_tokens=usage_data.get("total_tokens", 0),
             )
         else:
             # Estimate when the endpoint doesn't return usage
-            estimated = len(str(msg.content or "")) // _CHARS_PER_TOKEN
+            estimated = len(str(msg.get("content") or "")) // _CHARS_PER_TOKEN
             usage = Usage(0, estimated, estimated)
 
+        # reasoning is intentionally discarded — thinking improves quality but
+        # the chain itself is not needed by the agent.
         return LLMResponse(
-            content=msg.content,
+            content=msg.get("content"),
             tool_calls=tool_calls,
             usage=usage,
             raw=raw,

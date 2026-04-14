@@ -1,20 +1,19 @@
 # ─────────────────────────────────────────────────────────────
 # auto-mazur configuration
 # All values can be overridden by environment variables:
-#   MAZUR_MODEL, MAZUR_API_BASE, MAZUR_API_KEY, etc.
+#   MAZUR_MODEL, MAZUR_API_BASE, etc.
+# No API key required — vLLM over Tailscale has no authentication.
 # ─────────────────────────────────────────────────────────────
 
-# LLM endpoint (OpenAI-compatible)
-model: "gpt-4o"
-api_base: "https://api.openai.com/v1"
-api_key_env: "OPENAI_API_KEY"   # env var to read the key from
+# LLM endpoint (vLLM OpenAI-compatible, no auth)
+model: "LilaRest/gemma-4-31B-it-NVFP4-turbo"
+api_base: "http://localhost:8000/v1"
 max_retries: 3
 
 # Context window of the configured model.
 # MINIMUM 100 000 tokens — the agent will refuse to start with less.
 # Used to derive the compression threshold and as a reference ceiling.
-# Default: 128 000 (gpt-4o).
-context_length_tokens: 128000
+context_length_tokens: 180000
 
 # Storage paths (relative to cwd, or absolute)
 workspace_root: "./workspace"
