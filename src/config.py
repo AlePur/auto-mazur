@@ -66,6 +66,13 @@ class Config:
     failure_streak_threshold: int = 10
     neglect_threshold_ticks: int = 5_000
 
+    # ── Gateway HTTP server ────────────────────────────────────────────────
+    # Set gateway_enabled: true in config.yaml (or MAZUR_GATEWAY_ENABLED=true)
+    # to start the observation/inbox HTTP server alongside the agent loop.
+    gateway_enabled: bool = False
+    gateway_host: str = "127.0.0.1"
+    gateway_port: int = 7878
+
     def effective_compress_threshold(self) -> int:
         """
         Return the effective compression threshold.
@@ -138,11 +145,14 @@ def _apply_env_overrides(cfg: Config) -> None:
             continue
         field_name = key[len("MAZUR_"):].lower()
         if field_name in valid:
-            # Coerce int fields
             current = getattr(cfg, field_name)
+            # Coerce int fields
             if isinstance(current, int):
                 try:
                     value = int(value)
                 except ValueError:
                     pass
+            # Coerce bool fields (true/1/yes → True, anything else → False)
+            elif isinstance(current, bool):
+                value = value.strip().lower() in ("1", "true", "yes", "on")
             setattr(cfg, field_name, value)

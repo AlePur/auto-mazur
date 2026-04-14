@@ -88,6 +88,7 @@ class ExecutiveTick:
 
         # ── Query / decision loop ──────────────────────────────────────────
         while True:
+            self._llm.set_call_context(actor=ACTOR_EXECUTIVE, tick_id=current_tick)
             try:
                 response = self._llm.chat(
                     messages=messages,
@@ -146,6 +147,7 @@ class ExecutiveTick:
                     ),
                 })
                 # One final LLM call with only action tools
+                self._llm.set_call_context(actor=ACTOR_EXECUTIVE, tick_id=current_tick)
                 try:
                     response = self._llm.chat(
                         messages=messages,

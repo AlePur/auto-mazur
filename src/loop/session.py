@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..characters import summarizer as sum_char
 from ..characters import worker as worker_char
@@ -43,6 +43,9 @@ from ..models import (
 )
 from ..tools import ToolExecutor, WORKER_TOOL_SCHEMAS, format_tool_result_for_llm, format_tool_call_for_transcript
 from ..workspace import Workspace
+
+if TYPE_CHECKING:
+    from ..audit import AuditLogger
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +78,7 @@ class WorkerSession:
         session_id: int,
         attempt: int = 0,
         previous_summary: str | None = None,
+        audit: "AuditLogger | None" = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -85,6 +89,7 @@ class WorkerSession:
         self._session_id = session_id
         self._attempt = attempt
         self._prev_summary = previous_summary
+        self._audit = audit
         self._executor = ToolExecutor(config)
 
         # Conversation state
@@ -107,7 +112,13 @@ class WorkerSession:
             # Proactive compression before calling the LLM
             self._maybe_compress()
 
-            # Call the LLM
+            # Call the LLM — set audit context so the entry carries the right metadata
+            self._llm.set_call_context(
+                actor=ACTOR_WORKER,
+                tick_id=tick_id,
+                session_id=self._session_id,
+                goal_id=self._goal.goal_id,
+            )
             try:
                 response = self._llm.chat(
                     messages=self._messages,
@@ -177,6 +188,23 @@ class WorkerSession:
                     self._consecutive_errors += 1
                 else:
                     self._consecutive_errors = 0
+
+                # Audit log the tool call (1-month retention)
+                if self._audit:
+                    try:
+                        self._audit.log_tool(
+                            actor=ACTOR_WORKER,
+                            tick_id=tick_id,
+                            session_id=self._session_id,
+                            goal_id=self._goal.goal_id,
+                            tool_name=tc.name,
+                            args=tc.arguments,
+                            output=result.output,
+                            is_error=result.is_error,
+                            truncated=result.truncated,
+                        )
+                    except Exception as exc:
+                        log.warning("audit.log_tool failed: %s", exc)
 
                 # Log to DB + transcript
                 self._log_tick(
@@ -281,6 +309,11 @@ class WorkerSession:
 
         try:
             compress_msgs = sum_char.compress_prompt(to_compress)
+            self._llm.set_call_context(
+                actor=ACTOR_WORKER,
+                session_id=self._session_id,
+                goal_id=self._goal.goal_id,
+            )
             response = self._llm.chat(compress_msgs, temperature=0.2)
             summary_text = response.content or "(no summary)"
         except Exception as exc:

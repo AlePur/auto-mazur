@@ -81,9 +81,20 @@ def main() -> None:
     log.info("Workspace: %s", config.workspace_root)
     log.info("Database: %s", config.db_path)
 
+    # Audit logger — always created so LLM outputs and tool calls are recorded
+    from .audit import AuditLogger
+    audit = AuditLogger(workspace_root=config.workspace_root)
+    log.info("Audit logs: %s/audit/", config.workspace_root)
+
+    if config.gateway_enabled:
+        log.info(
+            "Gateway enabled — HTTP server will start on http://%s:%d",
+            config.gateway_host, config.gateway_port,
+        )
+
     # Build and start the main loop
     from .loop.main import MainLoop
-    loop = MainLoop(config)
+    loop = MainLoop(config, audit=audit)
     loop.start()
 
     # Optionally seed an initial goal before the loop starts

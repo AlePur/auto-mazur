@@ -123,14 +123,14 @@ class ExecutiveAction:
 EXEC_TOOL_ASSIGN_TASK = "assign_task"
 EXEC_TOOL_CREATE_GOAL = "create_goal"
 EXEC_TOOL_UPDATE_GOAL = "update_goal"
-EXEC_TOOL_RESPOND = "respond"
+EXEC_TOOL_SEND_USER_MESSAGE = "send_user_message"
 EXEC_TOOL_REQUEST_REFLECTION = "request_reflection"
 
 EXEC_TOOLS = {
     EXEC_TOOL_ASSIGN_TASK,
     EXEC_TOOL_CREATE_GOAL,
     EXEC_TOOL_UPDATE_GOAL,
-    EXEC_TOOL_RESPOND,
+    EXEC_TOOL_SEND_USER_MESSAGE,
     EXEC_TOOL_REQUEST_REFLECTION,
 }
 
@@ -194,6 +194,7 @@ class LLMResponse:
     tool_calls: list[ToolCall]      # may be empty
     usage: Usage
     raw: Any = field(repr=False)    # original API response object
+    thinking: str | None = None     # reasoning_content from vLLM — audit-only, never forwarded to agents
 
 
 # ── Worker tool result ────────────────────────────────────────────────────

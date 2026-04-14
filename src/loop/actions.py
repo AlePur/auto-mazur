@@ -22,7 +22,7 @@ from ..models import (
     EXEC_TOOL_ASSIGN_TASK,
     EXEC_TOOL_CREATE_GOAL,
     EXEC_TOOL_REQUEST_REFLECTION,
-    EXEC_TOOL_RESPOND,
+    EXEC_TOOL_SEND_USER_MESSAGE,
     EXEC_TOOL_UPDATE_GOAL,
     ExecutiveAction,
     GOAL_STATUS_ACTIVE,
@@ -62,8 +62,8 @@ class ActionExecutor:
                     return self._create_goal(action)
                 case "update_goal":
                     return self._update_goal(action)
-                case "respond":
-                    return self._respond(action)
+                case "send_user_message":
+                    return self._send_user_message(action)
                 case "request_reflection":
                     return ActionResult(
                         action=action,
@@ -160,19 +160,27 @@ class ActionExecutor:
         log.info("Updated goal %s: %s", goal_id, updates)
         return ActionResult(action=action)
 
-    def _respond(self, action: ExecutiveAction) -> ActionResult:
+    def _send_user_message(self, action: ExecutiveAction) -> ActionResult:
         params = action.params
-        message_id = str(params.get("message_id", ""))
-        text = str(params.get("text", ""))
+        title = str(params.get("title", "")).strip()
+        content = str(params.get("content", "")).strip()
+        re_message_id = str(params.get("re_message_id", "")).strip()
 
-        if not text:
-            return ActionResult(action=action, error="respond: empty text")
+        if not title:
+            return ActionResult(action=action, error="send_user_message: missing title")
+        if not content:
+            return ActionResult(action=action, error="send_user_message: missing content")
 
-        # The outbox is read by the gateway. We just return the entry;
-        # the main loop writes it to the outbox table (or file, etc.).
+        # The outbox is written by the main loop (_deliver_outbox).
+        # We also carry re_message_id so the main loop can mark the inbox
+        # message as answered.
         entry = {
-            "message_id": message_id,
-            "text": text,
+            "title": title,
+            "content": content,
+            "re_message_id": re_message_id,
         }
-        log.info("Executive response to %s: %s", message_id, text[:80])
+        log.info(
+            "Executive → user | title=%r re=%r: %s",
+            title, re_message_id or "(unprompted)", content[:80],
+        )
         return ActionResult(action=action, outbox_entry=entry)

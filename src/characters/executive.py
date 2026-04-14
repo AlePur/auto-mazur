@@ -266,26 +266,35 @@ ACTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "respond",
+            "name": "send_user_message",
             "description": (
-                "Write a response to a user message. "
-                "The response is placed in the outbox and delivered by the gateway. "
-                "You can respond to a message multiple times "
-                "(e.g. 'working on it' then later 'done')."
+                "Send a message to the user. "
+                "Every message has a title (subject line) and content (body). "
+                "Optionally set re_message_id to quote the inbox message you are replying to — "
+                "this also marks that inbox message as answered. "
+                "You can send multiple messages per tick, and you can follow up on "
+                "already-answered messages at any time."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "message_id": {
+                    "title": {
                         "type": "string",
-                        "description": "ID of the inbox message being responded to.",
+                        "description": "Short subject line / headline for the message.",
                     },
-                    "text": {
+                    "content": {
                         "type": "string",
-                        "description": "The response text.",
+                        "description": "Full body of the message. Markdown is fine.",
+                    },
+                    "re_message_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. ID of the inbox message this is a reply to. "
+                            "Setting this marks that inbox message as answered."
+                        ),
                     },
                 },
-                "required": ["message_id", "text"],
+                "required": ["title", "content"],
             },
         },
     },

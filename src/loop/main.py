@@ -15,20 +15,23 @@ every action (worker tool call, executive decision) so a crash loses at
 most one tick.
 
 Inbox / outbox:
-  The gateway integration is intentionally left as a hook.
-  By default the inbox is empty and the outbox is logged.
-  To wire in real messages: subclass MainLoop and override
-  _load_inbox() and _deliver_outbox().
+  Inbox messages stay visible to the Executive every tick until the
+  Executive explicitly replies to them via send_user_message(re_message_id=…).
+  Sending a reply marks the inbox message answered and writes an outbox row
+  with a title + content.  Answered messages remain visible to the Executive
+  (for follow-up) for INBOX_ANSWERED_TTL_SECONDS, then are auto-deleted.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 import traceback
+import uuid
+from typing import TYPE_CHECKING
 
 from ..config import Config
 from ..consolidation import Consolidation
-from ..context import worker as worker_context
 from ..db import Database
 from ..health import HealthChecker
 from ..llm import LLMClient
@@ -42,23 +45,25 @@ from ..models import (
     Task,
     TickRecord,
 )
-from ..tools import ToolExecutor
 from ..workspace import Workspace
+
+if TYPE_CHECKING:
+    from ..audit import AuditLogger
 
 log = logging.getLogger(__name__)
 
 
 class MainLoop:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, audit: "AuditLogger | None" = None) -> None:
         self._config = config
+        self._audit = audit
 
         # Storage
         self._db = Database(config.db_file())
         self._workspace = Workspace(config.workspace_path())
 
-        # LLM + tools
-        self._llm = LLMClient(config)
-        self._tools = ToolExecutor(config)
+        # LLM (inject audit logger so every call is recorded)
+        self._llm = LLMClient(config, audit=audit)
 
         # Sub-systems
         self._health = HealthChecker(config, self._db)
@@ -79,14 +84,26 @@ class MainLoop:
             workspace=self._workspace,
         )
 
+        # Gateway HTTP server thread (started lazily in start())
+        self._gateway_server = None
+
         # State
         self._tick: int = 0
         self._last_result: SessionResult | None = None
+        self._started: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Initialise storage and resume from the last known tick."""
+        """Initialise storage, resume from the last known tick, and (if
+        configured) start the gateway HTTP server in a daemon thread.
+
+        Idempotent: safe to call multiple times (extra calls are no-ops).
+        """
+        if self._started:
+            return
+        self._started = True
+
         self._db.connect()
         self._db.ensure_schema()
         self._workspace.ensure_structure()
@@ -94,6 +111,10 @@ class MainLoop:
         # Resume: start one tick past the last recorded tick
         self._tick = self._db.get_last_tick_id() + 1
         log.info("Starting main loop at tick %d", self._tick)
+
+        # Start the gateway HTTP server (observation + inbox) if enabled
+        if self._config.gateway_enabled:
+            self._start_gateway()
 
     def stop(self) -> None:
         self._db.close()
@@ -221,16 +242,6 @@ class MainLoop:
                 task.goal_id, attempt + 1, self._config.max_task_attempts,
             )
 
-            # Build context
-            context_messages = worker_context.build(
-                goal=goal,
-                task=task,
-                workspace=self._workspace,
-                db=self._db,
-                attempt=attempt,
-                previous_summary=previous_summary,
-            )
-
             # Open session in DB and get session_id
             transcript_path = self._workspace.transcript_path(
                 goal.workspace_path, session_id=self._tick
@@ -241,32 +252,31 @@ class MainLoop:
                 tick_start=self._tick,
                 transcript_path=str(transcript_path),
             )
-
-            # Tick counter is shared by the session (mutated in place)
-            tick_counter = [self._tick]
+            tick_start_session = self._tick
 
             session = WorkerSession(
-                session_id=session_id,
-                task=task,
-                goal_title=goal.title,
-                context_messages=context_messages,
                 config=self._config,
                 llm=self._llm,
-                tools=self._tools,
                 db=self._db,
-                transcript_path=transcript_path,
-                tick_counter=tick_counter,
+                workspace=self._workspace,
+                goal=goal,
+                task=task,
+                session_id=session_id,
+                attempt=attempt,
+                previous_summary=previous_summary,
+                audit=self._audit,
             )
             result = session.run()
 
-            # Sync tick counter back
-            self._tick = tick_counter[0]
+            # WorkerSession updates tick via db.get_last_tick_id internally;
+            # sync our counter to whatever the session advanced it to.
+            self._tick = self._db.get_last_tick_id() + 1
 
             # Persist session result to DB
             self._db.complete_session(session_id, result)
 
             # Update goal stats
-            ticks_used = result.tick_end - result.tick_start
+            ticks_used = result.tick_end - tick_start_session
             self._db.update_goal(
                 task.goal_id,
                 last_worked_tick=self._tick,
@@ -293,31 +303,99 @@ class MainLoop:
 
         return final_result  # type: ignore[return-value]
 
-    # ── Gateway hooks (override in subclass for real integration) ──────────
+    # ── Inbox / Outbox (DB-backed, used when gateway is enabled) ──────────
+
+    #: Answered inbox messages remain visible to the Executive for this long
+    #: before being auto-deleted (3 days).
+    INBOX_ANSWERED_TTL_SECONDS: float = 3 * 24 * 3600
 
     def _load_inbox(self) -> list[dict]:
         """
-        Return a list of unhandled user messages.
-        Format: [{"id": str, "text": str, "received_at_tick": int}, ...]
+        Return inbox messages for the Executive's briefing.
 
-        Default: always empty (no gateway connected).
-        Override this in a subclass to wire in the real inbox table/API.
+        Unanswered messages are included on every tick until the Executive
+        explicitly replies to them.  Already-answered messages within the TTL
+        window are also included (marked answered=True) so the Executive can
+        follow up.  Expired answered messages are pruned here.
         """
-        return []
+        result: list[dict] = []
+        try:
+            # Prune expired answered messages
+            deleted = self._db.delete_expired_inbox(self.INBOX_ANSWERED_TTL_SECONDS)
+            if deleted:
+                log.debug("Pruned %d expired inbox message(s)", deleted)
+
+            # Unanswered — Executive must respond to these
+            for m in self._db.get_pending_inbox():
+                result.append({
+                    "id": m["msg_id"],
+                    "text": m["text"],
+                    "received_at": m["received_at"],
+                    "answered": False,
+                })
+
+            # Answered within TTL — Executive may follow up
+            for m in self._db.get_answered_inbox(self.INBOX_ANSWERED_TTL_SECONDS):
+                result.append({
+                    "id": m["msg_id"],
+                    "text": m["text"],
+                    "received_at": m["received_at"],
+                    "answered": True,
+                })
+        except Exception as exc:
+            log.warning("_load_inbox failed: %s", exc)
+        return result
 
     def _deliver_outbox(self, entry: dict) -> None:
         """
-        Deliver a response to the user.
-        entry: {"message_id": str, "text": str}
+        Persist an Executive message/reply to the outbox table.
+        entry: {"title": str, "content": str, "re_message_id": str}
 
-        Default: just log it.
-        Override this in a subclass to write to the outbox table/API.
+        If re_message_id is set, the corresponding inbox message is marked
+        as answered (so it stops appearing in the unanswered section).
         """
-        log.info(
-            "OUTBOX → [%s]: %s",
-            entry.get("message_id", "?"),
-            entry.get("text", "")[:120],
+        title = entry.get("title", "")
+        content = entry.get("content", "")
+        re_message_id = entry.get("re_message_id", "")
+        log.info("OUTBOX → title=%r re=%r: %s", title, re_message_id or "(none)", content[:120])
+        try:
+            self._db.add_outbox_entry(
+                msg_id=str(uuid.uuid4()),
+                reply_to=re_message_id,
+                title=title,
+                content=content,
+                sent_at=time.time(),
+            )
+            # Mark the inbox message as answered
+            if re_message_id:
+                self._db.mark_inbox_answered([re_message_id], time.time())
+        except Exception as exc:
+            log.warning("_deliver_outbox DB write failed: %s", exc)
+
+    # ── Gateway startup ────────────────────────────────────────────────────
+
+    def _start_gateway(self) -> None:
+        """Start the GatewayServer in a daemon thread."""
+        import threading
+        from ..gateway import GatewayServer
+
+        host = self._config.gateway_host
+        port = self._config.gateway_port
+        self._gateway_server = GatewayServer(
+            host=host,
+            port=port,
+            db=self._db,
+            workspace=self._workspace,
+            audit=self._audit,
+            loop=self,
         )
+        thread = threading.Thread(
+            target=self._gateway_server.serve_forever,
+            daemon=True,
+            name="gateway-http",
+        )
+        thread.start()
+        log.info("Gateway HTTP server listening on http://%s:%d", host, port)
 
     # ── Internal helpers ───────────────────────────────────────────────────
 

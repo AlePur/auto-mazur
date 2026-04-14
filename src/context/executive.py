@@ -49,9 +49,21 @@ def build(
     sections.append(f"**Current tick:** {current_tick}")
 
     # ── Inbox ──────────────────────────────────────────────────────────────
-    if pending_inbox:
-        lines = [f"## Inbox ({len(pending_inbox)} unread)"]
-        for msg in pending_inbox:
+    unanswered = [m for m in pending_inbox if not m.get("answered")]
+    answered   = [m for m in pending_inbox if m.get("answered")]
+
+    if unanswered:
+        lines = [f"## Inbox — {len(unanswered)} message(s) awaiting your reply"]
+        for msg in unanswered:
+            lines.append(f"- [{msg['id']}] {msg['text']}")
+        sections.append("\n".join(lines))
+
+    if answered:
+        lines = [
+            f"## Recent Messages — {len(answered)} already answered "
+            f"(visible for follow-up; use send_user_message with re_message_id to reply again)"
+        ]
+        for msg in answered:
             lines.append(f"- [{msg['id']}] {msg['text']}")
         sections.append("\n".join(lines))
 

@@ -130,6 +130,23 @@ CREATE TABLE IF NOT EXISTS weekly_index (
     file_path   TEXT NOT NULL,
     summary     TEXT NOT NULL DEFAULT ''   -- first line of the weekly summary
 );
+
+-- Inbox: user messages waiting to be read by the Executive on the next tick
+CREATE TABLE IF NOT EXISTS inbox (
+    msg_id      TEXT PRIMARY KEY,
+    text        TEXT NOT NULL,
+    received_at REAL NOT NULL,   -- time.time() epoch float
+    answered_at REAL             -- NULL = unanswered; set when Executive sends a reply
+);
+
+-- Outbox: Executive messages / replies sent to the user
+CREATE TABLE IF NOT EXISTS outbox (
+    msg_id      TEXT PRIMARY KEY,
+    reply_to    TEXT NOT NULL DEFAULT '',  -- inbox msg_id being replied to, if any
+    title       TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL DEFAULT '',
+    sent_at     REAL NOT NULL             -- time.time() epoch float
+);
 """
 
 
@@ -557,6 +574,99 @@ class Database:
                 FROM weekly_index
                 ORDER BY tick DESC LIMIT ?
                 """,
+                (n,),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    # ── Inbox ──────────────────────────────────────────────────────────────
+
+    def add_inbox_message(self, msg_id: str, text: str, received_at: float) -> None:
+        """Insert a new user message into the inbox (unanswered by default)."""
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO inbox (msg_id, text, received_at, answered_at) "
+                "VALUES (?, ?, ?, NULL)",
+                (msg_id, text, received_at),
+            )
+
+    def get_pending_inbox(self) -> list[dict]:
+        """Return all unanswered inbox messages, oldest first."""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT msg_id, text, received_at FROM inbox "
+                "WHERE answered_at IS NULL ORDER BY received_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_answered_inbox(self, ttl_seconds: float) -> list[dict]:
+        """Return inbox messages answered within the TTL window, oldest first."""
+        import time
+        cutoff = time.time() - ttl_seconds
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT msg_id, text, received_at, answered_at FROM inbox "
+                "WHERE answered_at IS NOT NULL AND answered_at > ? "
+                "ORDER BY received_at ASC",
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_inbox_answered(self, msg_ids: list[str], answered_at: float) -> None:
+        """Mark the given inbox messages as answered (Executive sent a reply)."""
+        if not msg_ids:
+            return
+        placeholders = ",".join("?" * len(msg_ids))
+        with self._cursor() as cur:
+            cur.execute(
+                f"UPDATE inbox SET answered_at = ? WHERE msg_id IN ({placeholders})",
+                (answered_at, *msg_ids),
+            )
+
+    def delete_expired_inbox(self, ttl_seconds: float) -> int:
+        """Delete answered inbox messages whose TTL has expired. Returns count deleted."""
+        import time
+        cutoff = time.time() - ttl_seconds
+        with self._cursor() as cur:
+            cur.execute(
+                "DELETE FROM inbox WHERE answered_at IS NOT NULL AND answered_at < ?",
+                (cutoff,),
+            )
+            return cur.rowcount
+
+    def get_recent_inbox(self, n: int) -> list[dict]:
+        """Return the n most-recent inbox messages (any answered state)."""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT msg_id, text, received_at, answered_at FROM inbox "
+                "ORDER BY received_at DESC LIMIT ?",
+                (n,),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    # ── Outbox ─────────────────────────────────────────────────────────────
+
+    def add_outbox_entry(
+        self,
+        msg_id: str,
+        reply_to: str,
+        title: str,
+        content: str,
+        sent_at: float,
+    ) -> None:
+        """Persist an Executive message/reply to the outbox."""
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO outbox (msg_id, reply_to, title, content, sent_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (msg_id, reply_to, title, content, sent_at),
+            )
+
+    def get_recent_outbox(self, n: int) -> list[dict]:
+        """Return the n most-recent outbox entries, oldest first."""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT msg_id, reply_to, title, content, sent_at FROM outbox "
+                "ORDER BY sent_at DESC LIMIT ?",
                 (n,),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]

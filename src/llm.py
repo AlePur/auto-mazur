@@ -12,8 +12,9 @@ Set config.api_base and config.model to point at the vLLM server on Tailscale.
 
 Thinking/reasoning (Gemma 4):
   - Every request includes chat_template_kwargs: {enable_thinking: true}.
-  - The model's reasoning chain is produced internally and improves output quality,
-    but the reasoning tokens are discarded — only content is returned.
+  - The model's reasoning chain is captured in LLMResponse.thinking and written
+    to the audit log (if an AuditLogger is injected).  It is NEVER forwarded
+    back into any agent message list — doing so would pollute the context window.
 """
 
 from __future__ import annotations
@@ -21,12 +22,15 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from .config import Config
 from .models import LLMResponse, ToolCall, Usage
+
+if TYPE_CHECKING:
+    from .audit import AuditLogger
 
 log = logging.getLogger(__name__)
 
@@ -38,15 +42,52 @@ _CHARS_PER_TOKEN = 4
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+# Context carried through one LLM call for audit annotation.
+# Set via LLMClient.set_call_context() before each call.
+_CallContext = dict  # {"actor": str, "tick_id": int|None, "session_id": int|None, "goal_id": str|None}
+
+
 class LLMClient:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, audit: "AuditLogger | None" = None) -> None:
         self._cfg = config
+        self._audit = audit
         self._http = httpx.Client(
             base_url=config.api_base,
             headers={"Content-Type": "application/json"},
             # Generous timeout: vLLM may take a while for long reasoning chains.
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
         )
+        # Current call context — set by callers before each LLM call so audit
+        # entries carry the right actor/tick/session/goal metadata.
+        self._call_ctx: _CallContext = {
+            "actor": "unknown",
+            "tick_id": None,
+            "session_id": None,
+            "goal_id": None,
+        }
+
+    def set_audit(self, audit: "AuditLogger") -> None:
+        """Attach (or replace) the audit logger after construction."""
+        self._audit = audit
+
+    def set_call_context(
+        self,
+        actor: str,
+        tick_id: int | None = None,
+        session_id: int | None = None,
+        goal_id: str | None = None,
+    ) -> None:
+        """
+        Set metadata that will be attached to the next audit log entry.
+        Call this immediately before chat() / chat_json() so the entry
+        carries the correct actor and tick information.
+        """
+        self._call_ctx = {
+            "actor": actor,
+            "tick_id": tick_id,
+            "session_id": session_id,
+            "goal_id": goal_id,
+        }
 
     # ── Main interface ─────────────────────────────────────────────────────────
 
@@ -78,7 +119,9 @@ class LLMClient:
             body["tool_choice"] = tool_choice or "auto"
 
         raw = self._call_with_retry(body)
-        return self._parse_response(raw)
+        resp = self._parse_response(raw)
+        self._audit_llm(resp)
+        return resp
 
     def chat_json(
         self,
@@ -98,6 +141,7 @@ class LLMClient:
         }
         raw = self._call_with_retry(body)
         resp = self._parse_response(raw)
+        self._audit_llm(resp)
         text = resp.content or "{}"
         try:
             return json.loads(text)
@@ -192,11 +236,41 @@ class LLMClient:
             estimated = len(str(msg.get("content") or "")) // _CHARS_PER_TOKEN
             usage = Usage(0, estimated, estimated)
 
-        # reasoning is intentionally discarded — thinking improves quality but
-        # the chain itself is not needed by the agent.
+        # Capture reasoning_content (Gemma 4 / vLLM thinking field).
+        # This is stored in LLMResponse.thinking for the audit log ONLY.
+        # It is never injected back into any agent message list.
+        thinking: str | None = msg.get("reasoning_content") or None
+
         return LLMResponse(
             content=msg.get("content"),
             tool_calls=tool_calls,
             usage=usage,
             raw=raw,
+            thinking=thinking,
         )
+
+    def _audit_llm(self, resp: LLMResponse) -> None:
+        """Write one LLM call to the audit log (no-op if no logger attached)."""
+        if not self._audit:
+            return
+        try:
+            ctx = self._call_ctx
+            self._audit.log_llm(
+                actor=ctx["actor"],
+                tick_id=ctx["tick_id"],
+                session_id=ctx["session_id"],
+                goal_id=ctx["goal_id"],
+                thinking=resp.thinking,
+                content=resp.content,
+                tool_calls=[
+                    {"name": tc.name, "args": tc.arguments, "call_id": tc.call_id}
+                    for tc in resp.tool_calls
+                ],
+                usage={
+                    "prompt_tokens": resp.usage.prompt_tokens,
+                    "completion_tokens": resp.usage.completion_tokens,
+                    "total_tokens": resp.usage.total_tokens,
+                },
+            )
+        except Exception as exc:
+            log.warning("_audit_llm failed: %s", exc)
