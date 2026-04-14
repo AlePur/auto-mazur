@@ -16,23 +16,15 @@ LLMClient.chat_json() or LLMClient.chat().
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..models import TickRecord
 
+_SOULS = Path(__file__).parent.parent / "souls"
 
 # ── Journal entry — summarise recent ticks ───────────────────────────────
 
-_JOURNAL_SYSTEM = """\
-You are summarising the recent actions of an autonomous agent for its journal.
-
-Write a concise journal entry in markdown. Focus on:
-- What was accomplished
-- What failed and why (if anything)
-- Key decisions made
-- Important things learned
-
-Be specific: mention file paths, error messages, command names when relevant.
-Be concise: aim for 150-300 words. No fluff.
-"""
+_JOURNAL_SYSTEM = (_SOULS / "summarizer-journal.md").read_text()
 
 
 def journal_prompt(ticks: list[TickRecord], goal_title: str) -> list[dict]:
@@ -57,22 +49,7 @@ def journal_prompt(ticks: list[TickRecord], goal_title: str) -> list[dict]:
 
 # ── Context window compression ────────────────────────────────────────────
 
-_COMPRESS_SYSTEM = """\
-You are summarising the middle portion of an autonomous agent's work session.
-
-The agent is working on a task. You are given the conversation history from
-the middle of the session (not the beginning or end).
-
-Produce a concise summary that the agent can use to restore context. Include:
-- What the agent was trying to do at this point
-- Commands run and their results (especially any errors)
-- Files read or written
-- Current state of the work
-- Any important values, paths, or findings
-
-Be specific and factual. This summary replaces the raw messages in the
-agent's context window, so include everything it would need to continue.
-"""
+_COMPRESS_SYSTEM = (_SOULS / "summarizer-compress.md").read_text()
 
 
 def compress_prompt(messages: list[dict]) -> list[dict]:
@@ -108,18 +85,7 @@ def compress_prompt(messages: list[dict]) -> list[dict]:
 
 # ── Weekly summary — summarise journal entries ────────────────────────────
 
-_WEEKLY_SYSTEM = """\
-You are writing a weekly summary for an autonomous agent.
-
-You are given a set of recent journal entries. Synthesise them into a
-weekly summary that captures:
-- Major accomplishments across all goals
-- Persistent problems or patterns
-- The current state of each active goal
-- Anything that should be remembered going forward
-
-Aim for 200-400 words in markdown format.
-"""
+_WEEKLY_SYSTEM = (_SOULS / "summarizer-weekly.md").read_text()
 
 
 def weekly_prompt(journal_entries: list[str]) -> list[dict]:
@@ -138,26 +104,7 @@ def weekly_prompt(journal_entries: list[str]) -> list[dict]:
 
 # ── Checkpoint update — summarise current goal state ─────────────────────
 
-_CHECKPOINT_SYSTEM = """\
-You are writing a CHECKPOINT.md for an autonomous agent goal.
-
-The checkpoint is read at the start of every work session on this goal.
-It should tell the agent exactly where it left off and what to do next.
-
-Format:
-## Where I left off
-(1-2 sentences)
-
-## Next steps
-1. ...
-2. ...
-3. ...
-
-## Gotchas / notes
-(any non-obvious things to remember)
-
-Be specific and concrete.
-"""
+_CHECKPOINT_SYSTEM = (_SOULS / "summarizer-checkpoint.md").read_text()
 
 
 def checkpoint_prompt(
