@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────
+# auto-mazur configuration
+# All values can be overridden by environment variables:
+#   MAZUR_MODEL, MAZUR_API_BASE, MAZUR_API_KEY, etc.
+# ─────────────────────────────────────────────────────────────
+
+# LLM endpoint (OpenAI-compatible)
+model: "gpt-4o"
+api_base: "https://api.openai.com/v1"
+api_key_env: "OPENAI_API_KEY"   # env var to read the key from
+max_retries: 3
+
+# Storage paths (relative to cwd, or absolute)
+workspace_root: "./workspace"
+db_path: "./agent.db"
+
+# Tool limits — these protect the infrastructure, not the computer
+command_timeout_seconds: 300    # kill shell commands after 5 min
+max_output_bytes: 102400        # truncate stdout/stderr at 100 KB
+max_read_bytes: 102400          # truncate file reads at 100 KB
+
+# Worker execution session limits
+max_actions_per_session: 200            # tool calls per session
+max_consecutive_errors: 5              # consecutive tool errors before ending session
+context_compress_threshold_tokens: 60000  # compress conversation middle above this
+
+# Task loop
+max_task_attempts: 3            # retry a task this many times before giving up
+
+# Consolidation schedule (in ticks)
+checkpoint_interval: 50         # rewrite CHECKPOINT.md
+journal_interval: 500           # write a journal entry
+reflection_interval: 2000       # trigger the Reflector
+weekly_summary_interval: 5000   # summarise journals into a weekly doc
+archive_interval: 50000         # archive old ticks, compress old transcripts
+
+# Health checks
+stuck_detection_window: 5       # identical action summaries in a row = stuck
+failure_streak_threshold: 10    # consecutive 'error' outcomes = streak
+neglect_threshold_ticks: 5000   # active goal not touched in this many ticks = neglected
