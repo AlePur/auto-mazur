@@ -136,39 +136,6 @@ def weekly_prompt(journal_entries: list[str]) -> list[dict]:
     ]
 
 
-# ── Session summary — summarise a Worker session ──────────────────────────
-
-_SESSION_SYSTEM = """\
-You are summarising a completed work session of an autonomous agent.
-
-Write 2-4 sentences that capture:
-- What the task was
-- What was accomplished (or why it failed)
-- The final state / outcome
-
-Be specific. This summary will be shown to the Executive on the next tick.
-"""
-
-
-def session_prompt(task_description: str, status: str, raw_summary: str) -> list[dict]:
-    """
-    Build a prompt for refining a raw session summary into a clean 2-4 sentence version.
-    Used when the Worker's finish() call summary is unclear or too long.
-    """
-    return [
-        {"role": "system", "content": _SESSION_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                f"Task: {task_description}\n"
-                f"Outcome: {status}\n"
-                f"Worker's own summary: {raw_summary}\n\n"
-                "Write a clean 2-4 sentence summary."
-            ),
-        },
-    ]
-
-
 # ── Checkpoint update — summarise current goal state ─────────────────────
 
 _CHECKPOINT_SYSTEM = """\

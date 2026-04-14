@@ -10,9 +10,11 @@ The Worker sees NOTHING about:
 It only sees what it needs to do the work:
   - The task description and success criteria
   - Where to find its working directory
-  - The checkpoint from last time (if any)
-  - Any relevant knowledge (keyword matched)
+  - The checkpoint from last time (capped)
+  - Any relevant knowledge (keyword matched, capped)
   - Previous attempt summary (if this is a retry)
+
+All content is capped to keep the initial context bounded.
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ from ..db import Database
 from ..models import Goal, Task
 from ..workspace import Workspace
 
-_MAX_KNOWLEDGE_ITEMS = 5
-_MAX_KNOWLEDGE_CHARS = 800
+# ── Caps ───────────────────────────────────────────────────────────────────
+_MAX_KNOWLEDGE_ITEMS    = 5     # knowledge files injected
+_MAX_KNOWLEDGE_CHARS    = 800   # chars per knowledge item
+_MAX_CHECKPOINT_CHARS   = 3_000 # chars for checkpoint (full detail for worker)
 
 
 def build(
@@ -54,9 +58,11 @@ def build(
         f"files here freely. Use shell() to explore."
     )
 
-    # ── Checkpoint (where we left off) ────────────────────────────────────
+    # ── Checkpoint (where we left off) — capped ───────────────────────────
     checkpoint = workspace.read_checkpoint(goal.workspace_path)
     if checkpoint:
+        if len(checkpoint) > _MAX_CHECKPOINT_CHARS:
+            checkpoint = checkpoint[:_MAX_CHECKPOINT_CHARS] + "\n...[truncated]"
         sections.append(f"## Where You Left Off\n{checkpoint}")
 
     # ── Retry context ──────────────────────────────────────────────────────
@@ -67,7 +73,7 @@ def build(
             "Consider a different approach this time."
         )
 
-    # ── Relevant knowledge (keyword search) ───────────────────────────────
+    # ── Relevant knowledge (keyword search, capped) ───────────────────────
     keywords = _extract_keywords(task.description, goal.title)
     relevant = _fetch_relevant_knowledge(keywords, db, workspace)
     if relevant:

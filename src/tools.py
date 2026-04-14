@@ -1,18 +1,20 @@
 """
 Tool implementations — the Worker's interface to the real world.
 
-Three tools, nothing more:
-  shell(command)         → run any shell command via bash
-  read(path)             → read a file
-  write(path, content)   → write a file
+Four tools:
+  shell(command)              → run any shell command via bash
+  read(path, lines="0-100")  → read a file, optionally a line range
+  write(path, content)       → write a file
+  finish(summary, status)    → end the session
 
-The only constraints are engineering ones that protect the infrastructure:
-  - Commands are killed after config.command_timeout_seconds
-  - Output is truncated at config.max_output_bytes (can't fit 10MB in context)
-  - File reads are truncated at config.max_read_bytes
+The read tool always applies two caps (whichever is more restrictive):
+  - lines range (default first 100 lines, configurable via config.max_read_lines)
+  - hard character cap (config.max_read_chars, ~7 500 tokens)
 
-No deny-lists, no path jails, no content filtering.
-The OS user's permissions are the only security boundary.
+Output always includes file metadata so the Worker knows the full file size
+and can issue follow-up reads with a different line range.
+
+Shell output is truncated at config.max_output_bytes.
 
 finish() is handled by the execution loop (session.py), not here.
 """
@@ -32,7 +34,6 @@ log = logging.getLogger(__name__)
 
 
 # ── OpenAI function-calling schemas for the Worker's tools ────────────────
-# These are passed verbatim to the LLM in the tools parameter.
 
 WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -62,8 +63,11 @@ WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "read",
             "description": (
-                "Read the contents of a file at the given path. "
-                "Very large files are truncated with a note."
+                "Read the contents of a file. "
+                "By default returns the first 100 lines. "
+                "Use the `lines` parameter to read a specific range, e.g. '100-200'. "
+                "Output always includes a header showing total file size so you can "
+                "plan follow-up reads for large files."
             ),
             "parameters": {
                 "type": "object",
@@ -71,7 +75,15 @@ WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "path": {
                         "type": "string",
                         "description": "Absolute or relative path to the file.",
-                    }
+                    },
+                    "lines": {
+                        "type": "string",
+                        "description": (
+                            "Line range to return, zero-indexed, inclusive. "
+                            "Format: 'START-END', e.g. '0-100', '200-300', '500-600'. "
+                            "Omit to get the default first 100 lines."
+                        ),
+                    },
                 },
                 "required": ["path"],
             },
@@ -153,7 +165,10 @@ class ToolExecutor:
             case "shell":
                 return self.shell(arguments.get("command", ""))
             case "read":
-                return self.read(arguments.get("path", ""))
+                return self.read(
+                    arguments.get("path", ""),
+                    arguments.get("lines", None),
+                )
             case "write":
                 return self.write(
                     arguments.get("path", ""),
@@ -222,14 +237,24 @@ class ToolExecutor:
 
         return ToolResult(output=output, is_error=is_error, truncated=truncated)
 
-    def read(self, path: str) -> ToolResult:
+    def read(self, path: str, lines: str | None = None) -> ToolResult:
+        """
+        Read a file, optionally a specific line range.
+
+        `lines` format: "START-END" (zero-indexed, inclusive).
+        Default: first config.max_read_lines lines.
+
+        Output is always capped at config.max_read_chars characters.
+        A metadata header is prepended so the Worker knows the full file size.
+        """
         if not path.strip():
             return ToolResult(output="[empty path]", is_error=True, truncated=False)
 
         p = Path(path)
-        log.debug("read: %s", p)
+        log.debug("read: %s lines=%s", p, lines)
+
         try:
-            raw = p.read_bytes()
+            raw_bytes = p.read_bytes()
         except FileNotFoundError:
             return ToolResult(
                 output=f"[FILE NOT FOUND: {path}]",
@@ -249,22 +274,46 @@ class ToolExecutor:
                 truncated=False,
             )
 
-        truncated = False
-        if len(raw) > self._cfg.max_read_bytes:
-            original_len = len(raw)
-            raw = raw[: self._cfg.max_read_bytes]
-            text = raw.decode(errors="replace")
-            text += (
-                f"\n[TRUNCATED — file is {original_len:,} bytes; "
-                f"showing first {self._cfg.max_read_bytes:,} bytes. "
-                "Use shell('grep pattern file') or shell('head -n N file') "
-                "for targeted access.]"
-            )
-            truncated = True
-        else:
-            text = raw.decode(errors="replace")
+        # Decode full text for line-based slicing
+        full_text = raw_bytes.decode(errors="replace")
+        all_lines = full_text.splitlines(keepends=True)
+        total_lines = len(all_lines)
+        total_bytes = len(raw_bytes)
 
-        return ToolResult(output=text, is_error=False, truncated=truncated)
+        # Parse line range
+        default_end = self._cfg.max_read_lines - 1  # 0-indexed inclusive
+        line_start, line_end = _parse_line_range(lines, default_end)
+
+        # Clamp to actual file length
+        line_start = max(0, min(line_start, total_lines))
+        line_end = max(line_start, min(line_end, total_lines - 1))
+
+        selected_lines = all_lines[line_start : line_end + 1]
+        text = "".join(selected_lines)
+
+        # Apply hard character cap
+        char_cap = self._cfg.max_read_chars
+        truncated = False
+        if char_cap > 0 and len(text) > char_cap:
+            text = text[:char_cap]
+            truncated = True
+
+        # Build metadata header
+        showing_lines = f"{line_start}-{line_end}" if total_lines > 0 else "0-0"
+        header = (
+            f"[File: {path} | "
+            f"Total: {total_lines} lines / {total_bytes:,} bytes | "
+            f"Showing lines {showing_lines}"
+        )
+        if truncated:
+            header += f" | TRUNCATED at {char_cap:,} chars"
+        header += "]\n"
+
+        return ToolResult(
+            output=header + text,
+            is_error=False,
+            truncated=truncated,
+        )
 
     def write(self, path: str, content: str) -> ToolResult:
         if not path.strip():
@@ -326,3 +375,31 @@ def format_tool_call_for_transcript(
         "truncated": result.truncated,
         "error": result.is_error,
     })
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _parse_line_range(lines: str | None, default_end: int) -> tuple[int, int]:
+    """
+    Parse a 'START-END' line range string.
+    Returns (start, end) as zero-indexed inclusive integers.
+    Falls back to (0, default_end) on any parse error.
+    """
+    if not lines:
+        return 0, default_end
+
+    lines = lines.strip()
+    try:
+        if "-" in lines:
+            parts = lines.split("-", 1)
+            start = int(parts[0].strip())
+            end = int(parts[1].strip())
+            if start < 0 or end < start:
+                return 0, default_end
+            return start, end
+        else:
+            # Single number — treat as end line
+            end = int(lines)
+            return 0, max(0, end)
+    except (ValueError, IndexError):
+        return 0, default_end

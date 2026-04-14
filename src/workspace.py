@@ -9,8 +9,6 @@ in tools.py — those are not mediated by the workspace layer.
 Directory layout (relative to workspace_root):
   goals/
     <goal_id>-<slug>/
-      PLAN.md
-      STATUS.md
       CHECKPOINT.md
       journal/
         <tick_start>-<tick_end>.md
@@ -22,13 +20,13 @@ Directory layout (relative to workspace_root):
     <topic>.md
   meta/
     PRIORITIES.md
-    REFLECTIONS.md
+    reflections/
+      reflection-<tick>.md
     summaries/
       weekly-<tick>.md
-      monthly-<tick>.md
   scratch/
   archive/
-    ticks-<start>-<end>.jsonl.gz
+    ticks-before-<tick>.jsonl
 """
 
 from __future__ import annotations
@@ -41,7 +39,15 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 # Top-level dirs created on init
-_TOP_DIRS = ["goals", "knowledge", "meta", "meta/summaries", "scratch", "archive"]
+_TOP_DIRS = [
+    "goals",
+    "knowledge",
+    "meta",
+    "meta/reflections",
+    "meta/summaries",
+    "scratch",
+    "archive",
+]
 
 
 class Workspace:
@@ -63,8 +69,6 @@ class Workspace:
         Return the Path for a goal directory.  Does NOT require it to exist.
         The path is stored in Goal.workspace_path; use that as the key.
         """
-        # goal workspace_path is stored relative to workspace root
-        # If the caller has an absolute path use it directly, else resolve
         return self.root / "goals" / goal_id
 
     def create_goal_dir(self, goal_id: str, title_slug: str) -> str:
@@ -90,22 +94,6 @@ class Workspace:
         path = self.root / workspace_path / "CHECKPOINT.md"
         return path.read_text(encoding="utf-8") if path.exists() else None
 
-    # ── Plan / Status ──────────────────────────────────────────────────────
-
-    def write_plan(self, workspace_path: str, content: str) -> None:
-        (self.root / workspace_path / "PLAN.md").write_text(content, encoding="utf-8")
-
-    def read_plan(self, workspace_path: str) -> str | None:
-        path = self.root / workspace_path / "PLAN.md"
-        return path.read_text(encoding="utf-8") if path.exists() else None
-
-    def write_status(self, workspace_path: str, content: str) -> None:
-        (self.root / workspace_path / "STATUS.md").write_text(content, encoding="utf-8")
-
-    def read_status(self, workspace_path: str) -> str | None:
-        path = self.root / workspace_path / "STATUS.md"
-        return path.read_text(encoding="utf-8") if path.exists() else None
-
     # ── Journal ────────────────────────────────────────────────────────────
 
     def append_journal(
@@ -117,8 +105,15 @@ class Workspace:
         path.write_text(content, encoding="utf-8")
         return path
 
+    def read_journal_file(self, file_path: str) -> str | None:
+        """Read a journal file by its workspace-relative path."""
+        path = self.root / file_path
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
     def read_recent_journals(self, workspace_path: str, n: int) -> list[str]:
-        """Return content of the n most-recent journal entries (oldest first)."""
+        """Return content of the n most-recent journal entries (oldest first).
+        Legacy helper — prefer DB-backed get_recent_journals() + read_journal_file().
+        """
         journal_dir = self.root / workspace_path / "journal"
         if not journal_dir.exists():
             return []
@@ -145,7 +140,7 @@ class Workspace:
     def list_knowledge_files(self) -> list[Path]:
         return sorted((self.root / "knowledge").glob("*.md"))
 
-    # ── Meta ───────────────────────────────────────────────────────────────
+    # ── Meta — Priorities ──────────────────────────────────────────────────
 
     def write_priorities(self, content: str) -> None:
         (self.root / "meta" / "PRIORITIES.md").write_text(content, encoding="utf-8")
@@ -154,17 +149,45 @@ class Workspace:
         path = self.root / "meta" / "PRIORITIES.md"
         return path.read_text(encoding="utf-8") if path.exists() else None
 
-    def append_reflection(self, content: str) -> None:
-        path = self.root / "meta" / "REFLECTIONS.md"
-        with path.open("a", encoding="utf-8") as f:
-            f.write("\n\n---\n\n" + content)
+    # ── Meta — Reflections (one file per reflection) ───────────────────────
+
+    def write_reflection(self, tick: int, content: str) -> Path:
+        """Write a single reflection to its own file. Returns the path."""
+        path = self.root / "meta" / "reflections" / f"reflection-{tick}.md"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def read_reflection_file(self, file_path: str) -> str | None:
+        """Read a reflection file by its workspace-relative path."""
+        path = self.root / file_path
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
+    def read_recent_reflections(self, n: int) -> list[str]:
+        """Return content of the n most-recent reflection files (oldest first).
+        Legacy helper — prefer DB-backed get_recent_reflections() + read_reflection_file().
+        """
+        reflections_dir = self.root / "meta" / "reflections"
+        if not reflections_dir.exists():
+            return []
+        files = sorted(reflections_dir.glob("reflection-*.md"))[-n:]
+        return [f.read_text(encoding="utf-8") for f in files]
+
+    # ── Meta — Weekly summaries ────────────────────────────────────────────
 
     def write_weekly_summary(self, tick: int, content: str) -> Path:
         path = self.root / "meta" / "summaries" / f"weekly-{tick}.md"
         path.write_text(content, encoding="utf-8")
         return path
 
+    def read_weekly_file(self, file_path: str) -> str | None:
+        """Read a weekly summary file by its workspace-relative path."""
+        path = self.root / file_path
+        return path.read_text(encoding="utf-8") if path.exists() else None
+
     def read_weekly_summaries(self, n: int) -> list[str]:
+        """Return content of the n most-recent weekly summaries (oldest first).
+        Legacy helper — prefer DB-backed get_recent_weeklies() + read_weekly_file().
+        """
         files = sorted((self.root / "meta" / "summaries").glob("weekly-*.md"))[-n:]
         return [f.read_text(encoding="utf-8") for f in files]
 

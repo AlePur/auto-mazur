@@ -8,6 +8,8 @@ Schema notes:
     actions are not inside sessions)
   - FTS5 virtual table `knowledge_fts` enables fast keyword search over
     knowledge file contents indexed here
+  - journal_index / reflection_index / weekly_index provide lightweight
+    metadata for content files that live on disk as markdown
   - We deliberately avoid storing large blobs; transcripts live on disk
 """
 
@@ -99,6 +101,34 @@ CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
     content,
     content='knowledge_index',
     content_rowid='rowid'
+);
+
+-- Lightweight journal index — metadata only; content lives on disk as markdown
+CREATE TABLE IF NOT EXISTS journal_index (
+    goal_id     TEXT NOT NULL,
+    tick_start  INTEGER NOT NULL,
+    tick_end    INTEGER NOT NULL,
+    file_path   TEXT NOT NULL,      -- relative path inside workspace
+    summary     TEXT NOT NULL DEFAULT '',  -- first line of the entry
+    PRIMARY KEY (goal_id, tick_start),
+    FOREIGN KEY (goal_id) REFERENCES goals(goal_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_goal ON journal_index(goal_id, tick_start DESC);
+
+-- Lightweight reflection index — metadata only; content lives in meta/reflections/
+CREATE TABLE IF NOT EXISTS reflection_index (
+    tick            INTEGER PRIMARY KEY,
+    trigger_reason  TEXT NOT NULL DEFAULT '',
+    file_path       TEXT NOT NULL,
+    summary         TEXT NOT NULL DEFAULT ''   -- first non-empty line of observations
+);
+
+-- Lightweight weekly-summary index — metadata only; content lives in meta/summaries/
+CREATE TABLE IF NOT EXISTS weekly_index (
+    tick        INTEGER PRIMARY KEY,
+    file_path   TEXT NOT NULL,
+    summary     TEXT NOT NULL DEFAULT ''   -- first line of the weekly summary
 );
 """
 
@@ -412,6 +442,124 @@ class Database:
                 "FROM knowledge_index ORDER BY topic"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Journal index ──────────────────────────────────────────────────────
+
+    def upsert_journal(
+        self,
+        goal_id: str,
+        tick_start: int,
+        tick_end: int,
+        file_path: str,
+        summary: str = "",
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO journal_index
+                  (goal_id, tick_start, tick_end, file_path, summary)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(goal_id, tick_start) DO UPDATE SET
+                  tick_end  = excluded.tick_end,
+                  file_path = excluded.file_path,
+                  summary   = excluded.summary
+                """,
+                (goal_id, tick_start, tick_end, file_path, summary),
+            )
+
+    def get_recent_journals(
+        self, goal_id: str, n: int
+    ) -> list[dict]:
+        """Return the n most-recent journal index entries for a goal."""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT goal_id, tick_start, tick_end, file_path, summary
+                FROM journal_index
+                WHERE goal_id = ?
+                ORDER BY tick_start DESC LIMIT ?
+                """,
+                (goal_id, n),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def list_journals_for_goal(self, goal_id: str) -> list[dict]:
+        with self._cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT goal_id, tick_start, tick_end, file_path, summary
+                FROM journal_index WHERE goal_id = ?
+                ORDER BY tick_start ASC
+                """,
+                (goal_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Reflection index ───────────────────────────────────────────────────
+
+    def upsert_reflection(
+        self,
+        tick: int,
+        trigger_reason: str,
+        file_path: str,
+        summary: str = "",
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO reflection_index
+                  (tick, trigger_reason, file_path, summary)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(tick) DO UPDATE SET
+                  trigger_reason = excluded.trigger_reason,
+                  file_path      = excluded.file_path,
+                  summary        = excluded.summary
+                """,
+                (tick, trigger_reason, file_path, summary),
+            )
+
+    def get_recent_reflections(self, n: int) -> list[dict]:
+        """Return the n most-recent reflection index entries."""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT tick, trigger_reason, file_path, summary
+                FROM reflection_index
+                ORDER BY tick DESC LIMIT ?
+                """,
+                (n,),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    # ── Weekly summary index ───────────────────────────────────────────────
+
+    def upsert_weekly(
+        self, tick: int, file_path: str, summary: str = ""
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO weekly_index (tick, file_path, summary)
+                VALUES (?, ?, ?)
+                ON CONFLICT(tick) DO UPDATE SET
+                  file_path = excluded.file_path,
+                  summary   = excluded.summary
+                """,
+                (tick, file_path, summary),
+            )
+
+    def get_recent_weeklies(self, n: int) -> list[dict]:
+        """Return the n most-recent weekly summary index entries."""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT tick, file_path, summary
+                FROM weekly_index
+                ORDER BY tick DESC LIMIT ?
+                """,
+                (n,),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
 
 
 # ── Private helpers ────────────────────────────────────────────────────────

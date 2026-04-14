@@ -5,7 +5,8 @@ The Reflector gets a high-level snapshot of the agent's state.
 It does NOT see individual tick details (too noisy).
 It sees summaries, goals, patterns, and knowledge listings.
 
-The context stays bounded by using journal summaries rather than raw ticks.
+All lists are entry-capped and content-capped to keep context bounded
+regardless of how long the agent has been running.
 """
 
 from __future__ import annotations
@@ -13,9 +14,18 @@ from __future__ import annotations
 from ..db import Database
 from ..workspace import Workspace
 
-_MAX_JOURNAL_ENTRIES = 10   # per goal, max recent journal entries to include
-_MAX_WEEKLY_SUMMARIES = 5   # global weekly summaries
-_MAX_FAILURES = 20          # recent error-outcome ticks
+# ── Caps ───────────────────────────────────────────────────────────────────
+_MAX_GOALS              = 50    # total goals listed (all statuses)
+_MAX_FAILURES           = 20    # recent error-outcome ticks
+_MAX_RECENT_SESSIONS    = 10    # recent sessions (cross-goal)
+_MAX_ACTIVE_GOALS_JOURNALS = 5  # active goals to pull journal entries for
+_MAX_JOURNALS_PER_GOAL  = 3     # journal entries per goal
+_MAX_JOURNAL_CHARS      = 2_000 # chars per journal entry
+_MAX_WEEKLY_SUMMARIES   = 5     # weekly summaries included
+_MAX_WEEKLY_CHARS       = 2_000 # chars per weekly summary
+_MAX_PRIORITIES_CHARS   = 3_000 # chars for PRIORITIES.md
+_MAX_PREV_REFLECTIONS   = 3     # recent reflections for continuity
+_MAX_REFLECTION_CHARS   = 1_500 # chars per previous reflection
 
 
 def build(
@@ -35,20 +45,24 @@ def build(
         f"**Reason:** {trigger_reason}"
     )
 
-    # ── All goals ──────────────────────────────────────────────────────────
+    # ── All goals (capped) ─────────────────────────────────────────────────
     all_goals = db.get_all_goals()
-    if all_goals:
-        lines = ["## All Goals"]
-        for g in all_goals:
+    shown_goals = all_goals[:_MAX_GOALS]
+    hidden_goals = len(all_goals) - len(shown_goals)
+    if shown_goals:
+        lines = [f"## All Goals ({len(all_goals)} total)"]
+        for g in shown_goals:
             last = f"tick {g.last_worked_tick}" if g.last_worked_tick else "never"
             reason = f" ({g.blocked_reason})" if g.blocked_reason else ""
             lines.append(
                 f"- `{g.goal_id}` [{g.status}] p{g.priority} "
                 f"**{g.title}** — {g.total_ticks} ticks, last: {last}{reason}"
             )
+        if hidden_goals:
+            lines.append(f"- _...{hidden_goals} more goals not shown_")
         sections.append("\n".join(lines))
 
-    # ── Recent failures ────────────────────────────────────────────────────
+    # ── Recent failures (capped) ───────────────────────────────────────────
     recent_errors = [
         t for t in db.get_recent_ticks(n=200)
         if t.outcome == "error"
@@ -60,12 +74,14 @@ def build(
             lines.append(f"- tick {t.tick_id} {goal} {t.actor}/{t.action_type}: {t.summary}")
         sections.append("\n".join(lines))
 
-    # ── Current PRIORITIES.md ─────────────────────────────────────────────
+    # ── Current PRIORITIES.md (capped) ────────────────────────────────────
     priorities = workspace.read_priorities()
     if priorities:
+        if len(priorities) > _MAX_PRIORITIES_CHARS:
+            priorities = priorities[:_MAX_PRIORITIES_CHARS] + "\n...[truncated]"
         sections.append(f"## Current PRIORITIES.md\n{priorities}")
 
-    # ── Knowledge index ────────────────────────────────────────────────────
+    # ── Knowledge index (listing only) ────────────────────────────────────
     knowledge_list = db.list_knowledge()
     if knowledge_list:
         lines = ["## Knowledge Files"]
@@ -78,34 +94,61 @@ def build(
     else:
         sections.append("## Knowledge Files\n_(none yet)_")
 
-    # ── Recent journal entries (across active goals) ───────────────────────
+    # ── Recent journal entries (capped per goal, capped per entry) ─────────
     active_goals = db.get_active_goals()
     journal_sections: list[str] = []
-    for g in active_goals[:5]:  # cap at 5 goals to avoid huge context
-        entries = workspace.read_recent_journals(g.workspace_path, n=3)
-        if entries:
-            journal_sections.append(
-                f"### {g.title} ({g.goal_id})\n" + "\n\n".join(entries)
-            )
+    for g in active_goals[:_MAX_ACTIVE_GOALS_JOURNALS]:
+        entries = db.get_recent_journals(g.goal_id, _MAX_JOURNALS_PER_GOAL)
+        if not entries:
+            continue
+        goal_parts = []
+        for e in entries:
+            content = workspace.read_journal_file(e["file_path"]) or ""
+            if len(content) > _MAX_JOURNAL_CHARS:
+                content = content[:_MAX_JOURNAL_CHARS] + "\n...[truncated]"
+            goal_parts.append(f"_Ticks {e['tick_start']}–{e['tick_end']}_\n{content}")
+        journal_sections.append(
+            f"### {g.title} ({g.goal_id})\n" + "\n\n".join(goal_parts)
+        )
     if journal_sections:
-        sections.append("## Recent Journal Entries\n" + "\n\n---\n\n".join(journal_sections))
-
-    # ── Weekly summaries ──────────────────────────────────────────────────
-    weeklies = workspace.read_weekly_summaries(n=_MAX_WEEKLY_SUMMARIES)
-    if weeklies:
         sections.append(
-            "## Recent Weekly Summaries\n"
-            + "\n\n---\n\n".join(weeklies)
+            "## Recent Journal Entries\n" + "\n\n---\n\n".join(journal_sections)
         )
 
-    # ── Recent sessions (cross-goal) ──────────────────────────────────────
-    recent_sessions = db.get_recent_sessions(n=10)
+    # ── Weekly summaries (capped per entry) ───────────────────────────────
+    weekly_entries = db.get_recent_weeklies(_MAX_WEEKLY_SUMMARIES)
+    if weekly_entries:
+        weekly_parts = []
+        for w in weekly_entries:
+            content = workspace.read_weekly_file(w["file_path"]) or ""
+            if len(content) > _MAX_WEEKLY_CHARS:
+                content = content[:_MAX_WEEKLY_CHARS] + "\n...[truncated]"
+            weekly_parts.append(f"_Tick {w['tick']}_\n{content}")
+        sections.append(
+            "## Recent Weekly Summaries\n" + "\n\n---\n\n".join(weekly_parts)
+        )
+
+    # ── Recent sessions (cross-goal, summaries only) ───────────────────────
+    recent_sessions = db.get_recent_sessions(n=_MAX_RECENT_SESSIONS)
     if recent_sessions:
         lines = ["## Recent Sessions"]
         for s in recent_sessions:
             lines.append(
                 f"- session {s['session_id']} [{s['goal_id']}] "
                 f"`{s.get('status', '?')}`: {s.get('summary', '(no summary)')[:120]}"
+            )
+        sections.append("\n".join(lines))
+
+    # ── Previous reflections (for continuity, capped) ─────────────────────
+    prev_reflections = db.get_recent_reflections(_MAX_PREV_REFLECTIONS)
+    if prev_reflections:
+        lines = [f"## Previous Reflections (last {len(prev_reflections)})"]
+        for r in prev_reflections:
+            content = workspace.read_reflection_file(r["file_path"]) or ""
+            if len(content) > _MAX_REFLECTION_CHARS:
+                content = content[:_MAX_REFLECTION_CHARS] + "\n...[truncated]"
+            lines.append(
+                f"\n### Tick {r['tick']} ({r['trigger_reason']})\n{content}"
             )
         sections.append("\n".join(lines))
 

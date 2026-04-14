@@ -1,21 +1,27 @@
 """
 Executive tick — one call to the Executive character.
 
-Responsibilities:
-  - Assemble the Executive briefing (via context/executive.py)
-  - Call the LLM with the Executive's tools
-  - Parse the response into ExecutiveAction objects
-  - Log the tick to the DB
-  - Return the list of actions for the main loop to execute
+The Executive now operates in two phases per tick:
 
-The Executive always produces at least one action per tick.
-If the LLM returns no tool calls (which shouldn't happen with tool_choice="required"),
-we log an error tick and return an empty list — the main loop handles this gracefully.
+  1. Query phase — the LLM may call read-only query tools (read_checkpoint,
+     read_journal, read_knowledge, search_knowledge, list_sessions,
+     read_reflection) to gather more detail before deciding.  The
+     infrastructure executes each query tool and feeds the result back.
+     The query phase ends when:
+       a) the LLM calls one or more action tools, or
+       b) max_executive_queries query calls have been made (safety cap).
+
+  2. Decision phase — action tool calls (assign_task, create_goal, etc.)
+     are collected from the final LLM response and returned to the main
+     loop for execution.
+
+Query tools never mutate state.  Action tools always do.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from ..characters import executive as exec_char
 from ..context import executive as exec_context
@@ -34,6 +40,9 @@ from ..models import (
 from ..workspace import Workspace
 
 log = logging.getLogger(__name__)
+
+# Character cap on content returned by query tools to keep context bounded
+_QUERY_RESULT_MAX_CHARS = 4_000
 
 
 class ExecutiveTick:
@@ -58,11 +67,11 @@ class ExecutiveTick:
         pending_inbox: list[dict],
     ) -> list[ExecutiveAction]:
         """
-        Run one Executive tick.  Logs the tick to DB.
-        Returns the list of actions to execute (may be empty on parse failure).
+        Run one Executive tick (query phase + decision phase).
+        Returns the list of actions to execute (may be empty on failure).
         """
-        # Build briefing
-        messages = [
+        # Build initial briefing
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": exec_char.SYSTEM_PROMPT},
             *exec_context.build(
                 db=self._db,
@@ -74,47 +83,187 @@ class ExecutiveTick:
             ),
         ]
 
-        # Call LLM — require at least one tool call
+        query_count = 0
+        max_queries = self._config.max_executive_queries
+
+        # ── Query / decision loop ──────────────────────────────────────────
+        while True:
+            try:
+                response = self._llm.chat(
+                    messages=messages,
+                    tools=exec_char.ALL_TOOL_SCHEMAS,
+                    tool_choice="required",
+                    temperature=0.5,
+                )
+            except Exception as exc:
+                log.error("Executive LLM call failed at tick %d: %s", current_tick, exc)
+                self._log_tick(current_tick, f"LLM call failed: {exc}", OUTCOME_ERROR)
+                return []
+
+            if not response.tool_calls:
+                log.warning("Executive returned no tool calls at tick %d", current_tick)
+                self._log_tick(current_tick, "no tool calls returned", OUTCOME_ERROR)
+                return []
+
+            # Classify tool calls
+            query_calls = [tc for tc in response.tool_calls
+                           if tc.name in exec_char.EXEC_QUERY_TOOLS]
+            action_calls = [tc for tc in response.tool_calls
+                            if tc.name not in exec_char.EXEC_QUERY_TOOLS]
+
+            # If any action tools were called, extract and return them
+            if action_calls:
+                actions = exec_char.parse_actions(action_calls)
+                if actions:
+                    summary = " + ".join(
+                        f"{a.tool}({_params_preview(a.params)})" for a in actions
+                    )
+                    self._log_tick(current_tick, summary[:200], OUTCOME_OK)
+                    log.info("Executive tick %d: %s", current_tick, summary[:120])
+                    return actions
+                # parse_actions filtered everything out
+                self._log_tick(current_tick, "no valid actions produced", OUTCOME_ERROR)
+                return []
+
+            # Pure query calls — execute and loop back
+            if not query_calls:
+                log.warning("Executive returned no recognisable tool calls at tick %d",
+                            current_tick)
+                self._log_tick(current_tick, "no recognisable tool calls", OUTCOME_ERROR)
+                return []
+
+            if query_count >= max_queries:
+                log.warning(
+                    "Executive hit query cap (%d) at tick %d — forcing decision",
+                    max_queries, current_tick,
+                )
+                # Append a user message forcing a decision
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"You have used {max_queries} query calls. "
+                        "You must now call one or more action tools to make a decision."
+                    ),
+                })
+                # One final LLM call with only action tools
+                try:
+                    response = self._llm.chat(
+                        messages=messages,
+                        tools=exec_char.ACTION_TOOL_SCHEMAS,
+                        tool_choice="required",
+                        temperature=0.5,
+                    )
+                    actions = exec_char.parse_actions(response.tool_calls)
+                    summary = " + ".join(
+                        f"{a.tool}({_params_preview(a.params)})" for a in actions
+                    )
+                    self._log_tick(current_tick, summary[:200], OUTCOME_OK)
+                    return actions
+                except Exception as exc:
+                    log.error("Executive forced-decision call failed: %s", exc)
+                    self._log_tick(current_tick, f"forced-decision failed: {exc}", OUTCOME_ERROR)
+                    return []
+
+            # Execute query tools and append results to conversation
+            assistant_msg = _build_assistant_msg(response)
+            messages.append(assistant_msg)
+
+            for tc in query_calls:
+                query_count += 1
+                result_text = self._execute_query(tc.name, tc.arguments)
+                log.debug("Executive query %r → %d chars", tc.name, len(result_text))
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.call_id,
+                    "content": result_text,
+                })
+
+    # ── Query tool execution ───────────────────────────────────────────────
+
+    def _execute_query(self, name: str, args: dict) -> str:
+        """Execute one query tool and return its string result (capped)."""
         try:
-            response = self._llm.chat(
-                messages=messages,
-                tools=exec_char.TOOL_SCHEMAS,
-                tool_choice="required",    # Executive must always do something
-                temperature=0.5,
-            )
+            result = self._run_query(name, args)
         except Exception as exc:
-            log.error("Executive LLM call failed at tick %d: %s", current_tick, exc)
-            self._log_tick(
-                tick_id=current_tick,
-                summary=f"LLM call failed: {exc}",
-                outcome=OUTCOME_ERROR,
-            )
-            return []
+            return f"[Query error: {exc}]"
+        # Cap to avoid flooding context
+        if len(result) > _QUERY_RESULT_MAX_CHARS:
+            result = result[:_QUERY_RESULT_MAX_CHARS] + "\n...[truncated]"
+        return result
 
-        # Parse actions
-        actions = exec_char.parse_actions(response.tool_calls)
+    def _run_query(self, name: str, args: dict) -> str:
+        match name:
+            case "read_checkpoint":
+                goal_id = str(args.get("goal_id", ""))
+                goal = self._db.get_goal(goal_id)
+                if not goal:
+                    return f"[Goal {goal_id!r} not found]"
+                cp = self._workspace.read_checkpoint(goal.workspace_path)
+                return cp or "(no checkpoint yet)"
 
-        if not actions:
-            log.warning("Executive produced no valid actions at tick %d", current_tick)
-            self._log_tick(
-                tick_id=current_tick,
-                summary="no valid actions produced",
-                outcome=OUTCOME_ERROR,
-            )
-            return []
+            case "read_journal":
+                goal_id = str(args.get("goal_id", ""))
+                n = min(int(args.get("n", 3)), 10)
+                goal = self._db.get_goal(goal_id)
+                if not goal:
+                    return f"[Goal {goal_id!r} not found]"
+                entries = self._db.get_recent_journals(goal_id, n)
+                if not entries:
+                    return "(no journal entries yet)"
+                parts = []
+                for e in entries:
+                    content = self._workspace.read_journal_file(e["file_path"]) or "(unreadable)"
+                    parts.append(
+                        f"### Ticks {e['tick_start']}–{e['tick_end']}\n{content}"
+                    )
+                return "\n\n---\n\n".join(parts)
 
-        # Log tick — one line summary of all actions taken
-        action_summary = " + ".join(
-            f"{a.tool}({_params_preview(a.params)})" for a in actions
-        )
-        self._log_tick(
-            tick_id=current_tick,
-            summary=action_summary[:200],
-            outcome=OUTCOME_OK,
-        )
+            case "read_knowledge":
+                topic = str(args.get("topic", ""))
+                content = self._workspace.read_knowledge(topic)
+                return content or f"(no knowledge file for topic {topic!r})"
 
-        log.info("Executive tick %d: %s", current_tick, action_summary[:120])
-        return actions
+            case "search_knowledge":
+                query = str(args.get("query", ""))
+                hits = self._db.search_knowledge(query, limit=5)
+                if not hits:
+                    return "(no knowledge matches)"
+                lines = [f"Found {len(hits)} knowledge file(s):"]
+                for h in hits:
+                    lines.append(f"- **{h['topic']}**: {h['summary']}")
+                return "\n".join(lines)
+
+            case "list_sessions":
+                goal_id = str(args.get("goal_id", ""))
+                n = min(int(args.get("n", 5)), 20)
+                sessions = self._db.get_recent_sessions(n=n, goal_id=goal_id)
+                if not sessions:
+                    return "(no sessions yet)"
+                lines = [f"Last {len(sessions)} session(s) for {goal_id}:"]
+                for s in sessions:
+                    lines.append(
+                        f"- session {s['session_id']} "
+                        f"[{s.get('status', '?')}] "
+                        f"ticks {s['tick_start']}–{s.get('tick_end', '?')}: "
+                        f"{(s.get('summary') or '(no summary)')[:120]}"
+                    )
+                return "\n".join(lines)
+
+            case "read_reflection":
+                n = min(int(args.get("n", 2)), 5)
+                entries = self._db.get_recent_reflections(n)
+                if not entries:
+                    return "(no reflections yet)"
+                parts = []
+                for e in entries:
+                    content = self._workspace.read_reflection_file(e["file_path"]) or "(unreadable)"
+                    parts.append(
+                        f"### Reflection at tick {e['tick']} ({e['trigger_reason']})\n{content}"
+                    )
+                return "\n\n---\n\n".join(parts)
+
+            case _:
+                return f"[unknown query tool: {name!r}]"
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -131,6 +280,26 @@ class ExecutiveTick:
             ))
         except Exception as exc:
             log.error("Failed to log Executive tick %d: %s", tick_id, exc)
+
+
+def _build_assistant_msg(response) -> dict[str, Any]:
+    """Build an OpenAI-format assistant message with tool_calls."""
+    import json
+    tool_calls_raw = []
+    for tc in response.tool_calls:
+        tool_calls_raw.append({
+            "id": tc.call_id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": json.dumps(tc.arguments),
+            },
+        })
+    return {
+        "role": "assistant",
+        "content": response.content or None,
+        "tool_calls": tool_calls_raw,
+    }
 
 
 def _params_preview(params: dict) -> str:

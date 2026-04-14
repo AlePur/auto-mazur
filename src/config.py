@@ -14,6 +14,9 @@ from pathlib import Path
 
 import yaml
 
+# Minimum context window we are willing to run with.
+_MIN_CONTEXT_LENGTH_TOKENS = 100_000
+
 
 @dataclass
 class Config:
@@ -23,19 +26,29 @@ class Config:
     api_key_env: str = "OPENAI_API_KEY"
     max_retries: int = 3
 
+    # ── Context window ────────────────────────────────────────────────────
+    # Must be >= 100 000 — validated at load time.
+    context_length_tokens: int = 128_000
+
     # ── Storage ───────────────────────────────────────────────────────────
     workspace_root: str = "./workspace"
     db_path: str = "./agent.db"
 
     # ── Tool limits ───────────────────────────────────────────────────────
     command_timeout_seconds: int = 300
-    max_output_bytes: int = 102_400   # 100 KB
-    max_read_bytes: int = 102_400
+    max_output_bytes: int = 102_400   # 100 KB for shell output
+    max_read_bytes: int = 102_400     # 100 KB raw byte cap for file reads
+    max_read_chars: int = 30_000      # hard char cap for read tool (~7 500 tokens); 0 = use bytes cap only
+    max_read_lines: int = 100         # default lines returned when no range given
 
     # ── Worker session ────────────────────────────────────────────────────
     max_actions_per_session: int = 200
     max_consecutive_errors: int = 5
-    context_compress_threshold_tokens: int = 60_000
+    # 0 = auto (60 % of context_length_tokens). Set explicitly to override.
+    context_compress_threshold_tokens: int = 0
+
+    # ── Executive query loop ──────────────────────────────────────────────
+    max_executive_queries: int = 10
 
     # ── Task loop ─────────────────────────────────────────────────────────
     max_task_attempts: int = 3
@@ -66,6 +79,18 @@ class Config:
             )
         self.api_key = key
 
+    def effective_compress_threshold(self) -> int:
+        """
+        Return the effective compression threshold.
+
+        If context_compress_threshold_tokens is 0 (auto), derive it as
+        60 % of context_length_tokens.  Otherwise use the explicit value,
+        capped at context_length_tokens so it can never exceed the window.
+        """
+        if self.context_compress_threshold_tokens == 0:
+            return int(self.context_length_tokens * 0.6)
+        return min(self.context_compress_threshold_tokens, self.context_length_tokens)
+
     def workspace_path(self) -> Path:
         return Path(self.workspace_root).resolve()
 
@@ -76,7 +101,7 @@ class Config:
 def load_config(path: str | Path = "config.yaml") -> Config:
     """
     Load config from YAML file, then apply MAZUR_* env var overrides.
-    Finally resolves the API key from its named env var.
+    Finally resolves the API key and validates critical constraints.
     """
     cfg = Config()
 
@@ -88,10 +113,21 @@ def load_config(path: str | Path = "config.yaml") -> Config:
 
     _apply_env_overrides(cfg)
     cfg.resolve_api_key()
+    _validate(cfg)
     return cfg
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def _validate(cfg: Config) -> None:
+    """Raise on configuration that would cause the agent to malfunction."""
+    if cfg.context_length_tokens < _MIN_CONTEXT_LENGTH_TOKENS:
+        raise ValueError(
+            f"context_length_tokens is {cfg.context_length_tokens:,} but the minimum "
+            f"is {_MIN_CONTEXT_LENGTH_TOKENS:,}.  Update config.yaml or set "
+            f"MAZUR_CONTEXT_LENGTH_TOKENS to at least {_MIN_CONTEXT_LENGTH_TOKENS:,}."
+        )
+
 
 def _apply_dict(cfg: Config, data: dict) -> None:
     """Apply a dict of values to the Config dataclass, coercing types."""

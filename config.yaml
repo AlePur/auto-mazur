@@ -10,6 +10,12 @@ api_base: "https://api.openai.com/v1"
 api_key_env: "OPENAI_API_KEY"   # env var to read the key from
 max_retries: 3
 
+# Context window of the configured model.
+# MINIMUM 100 000 tokens — the agent will refuse to start with less.
+# Used to derive the compression threshold and as a reference ceiling.
+# Default: 128 000 (gpt-4o).
+context_length_tokens: 128000
+
 # Storage paths (relative to cwd, or absolute)
 workspace_root: "./workspace"
 db_path: "./agent.db"
@@ -17,12 +23,17 @@ db_path: "./agent.db"
 # Tool limits — these protect the infrastructure, not the computer
 command_timeout_seconds: 300    # kill shell commands after 5 min
 max_output_bytes: 102400        # truncate stdout/stderr at 100 KB
-max_read_bytes: 102400          # truncate file reads at 100 KB
+max_read_bytes: 102400          # truncate file reads at 100 KB (raw bytes; chars cap below applies first)
+max_read_chars: 30000           # hard character cap for the read tool (~7 500 tokens). 0 = use max_read_bytes only.
+max_read_lines: 100             # default number of lines returned by read tool when no range given
 
 # Worker execution session limits
 max_actions_per_session: 200            # tool calls per session
 max_consecutive_errors: 5              # consecutive tool errors before ending session
-context_compress_threshold_tokens: 60000  # compress conversation middle above this
+context_compress_threshold_tokens: 0   # 0 = auto (60 % of context_length_tokens). Set explicitly to override.
+
+# Executive query loop
+max_executive_queries: 10       # max information-gathering tool calls before Executive must decide
 
 # Task loop
 max_task_attempts: 3            # retry a task this many times before giving up

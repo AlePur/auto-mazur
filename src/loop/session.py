@@ -1,307 +1,333 @@
 """
-Worker execution session — the innermost loop.
+Worker session — one task execution loop.
 
-A session is a multi-turn conversation between the Worker (LLM with tools)
-and the real world (shell, files).  It runs until one of these conditions:
+A session is bounded by three things:
+  1. max_actions_per_session tool calls
+  2. max_consecutive_errors consecutive tool errors
+  3. context window: once the token count crosses
+     config.effective_compress_threshold(), the middle of the conversation
+     is compressed via the Summarizer.
 
-  Terminal (clean):
-    - Worker calls finish(status="done")    → SESSION_STATUS_DONE
-    - Worker calls finish(status="stuck")   → SESSION_STATUS_STUCK
-    - Worker calls finish(status="error")   → SESSION_STATUS_ERROR_STREAK
-
-  Terminal (infrastructure limit hit):
-    - action_count >= max_actions_per_session → SESSION_STATUS_MAX_ACTIONS
-    - consecutive_errors >= max_consecutive_errors → SESSION_STATUS_ERROR_STREAK
-    - tokens_used >= context_compress_threshold repeatedly → SESSION_STATUS_CONTEXT_OVERFLOW
-
-Each tool call is ONE tick.  The tick counter is passed in by the caller
-and incremented here.  All ticks are logged to the DB.
-
-The conversation is flushed to a JSONL transcript file after each exchange.
-Mid-session context compression is handled by the Summarizer when the
-conversation grows large.
+Termination reasons and how the main loop interprets them:
+  "done"           — task criteria met; log session, mark success
+  "stuck"          — Worker is blocked; Executive replans
+  "error"          — unrecoverable error state; increment attempts
+  "max_actions"    — hit the action limit; session was partial; continue
+  "max_errors"     — too many consecutive errors; log and retry
+  "context_overflow" — LLM refused due to context length; compress and retry
+                       in a new session (the compress happened at threshold,
+                       but the LLM still reported overflow — use lower threshold
+                       or reduce content)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 from typing import Any
 
-from ..characters import worker as worker_char
 from ..characters import summarizer as sum_char
+from ..characters import worker as worker_char
 from ..config import Config
+from ..context import worker as worker_context
 from ..db import Database
 from ..llm import LLMClient
 from ..models import (
     ACTOR_WORKER,
+    Goal,
     OUTCOME_ERROR,
     OUTCOME_OK,
-    SESSION_STATUS_CONTEXT_OVERFLOW,
-    SESSION_STATUS_DONE,
-    SESSION_STATUS_ERROR_STREAK,
-    SESSION_STATUS_MAX_ACTIONS,
-    SESSION_STATUS_STUCK,
     SessionResult,
     Task,
     TickRecord,
 )
-from ..tools import (
-    ToolExecutor,
-    format_tool_call_for_transcript,
-    format_tool_result_for_llm,
-)
+from ..tools import ToolExecutor, WORKER_TOOL_SCHEMAS, format_tool_result_for_llm, format_tool_call_for_transcript
+from ..workspace import Workspace
 
 log = logging.getLogger(__name__)
 
-# How many messages to keep at head and tail during compression
-_COMPRESS_HEAD = 2   # system prompt + task context
-_COMPRESS_TAIL = 20  # recent tool exchanges
+# Error message fragments that indicate an LLM context-length rejection
+_CONTEXT_OVERFLOW_PATTERNS = [
+    "context_length_exceeded",
+    "maximum context length",
+    "too many tokens",
+    "reduce the length",
+    "context window",
+    "token limit",
+]
 
 
 class WorkerSession:
+    """
+    Run a single task until termination.
+    Returns a SessionResult describing the final state.
+    """
+
     def __init__(
         self,
         *,
-        session_id: int,
-        task: Task,
-        goal_title: str,
-        context_messages: list[dict],   # from context/worker.py build()
         config: Config,
         llm: LLMClient,
-        tools: ToolExecutor,
         db: Database,
-        transcript_path: Path,
-        tick_counter: list[int],         # [current_tick] — mutated in place
+        workspace: Workspace,
+        goal: Goal,
+        task: Task,
+        session_id: int,
+        attempt: int = 0,
+        previous_summary: str | None = None,
     ) -> None:
-        self._session_id = session_id
-        self._task = task
-        self._goal_title = goal_title
         self._config = config
         self._llm = llm
-        self._tools = tools
         self._db = db
-        self._transcript_path = transcript_path
-        self._tick_counter = tick_counter
+        self._workspace = workspace
+        self._goal = goal
+        self._task = task
+        self._session_id = session_id
+        self._attempt = attempt
+        self._prev_summary = previous_summary
+        self._executor = ToolExecutor(config)
 
-        # Build the full initial messages list
-        self._messages: list[dict[str, Any]] = [
-            {"role": "system", "content": worker_char.SYSTEM_PROMPT},
-            *context_messages,
-        ]
+        # Conversation state
+        self._messages: list[dict[str, Any]] = []
+        self._transcript_entries: list[str] = []
 
+        # Session counters
         self._action_count = 0
         self._consecutive_errors = 0
         self._tokens_used = 0
-        self._finish_summary: str = ""
-        self._finish_status: str = ""
 
-        # Open transcript file for appending
-        transcript_path.parent.mkdir(parents=True, exist_ok=True)
-        self._transcript_file = transcript_path.open("a", encoding="utf-8")
-
-    # ── Main entry point ───────────────────────────────────────────────────
+    # ── Public API ─────────────────────────────────────────────────────────
 
     def run(self) -> SessionResult:
-        """Run the session to completion. Returns a SessionResult."""
-        tick_start = self._tick_counter[0]
-        terminal_status = SESSION_STATUS_MAX_ACTIONS  # default if limits hit
+        """Run the session loop to completion."""
+        self._init_messages()
+        tick_id = self._db.get_last_tick_id() + 1
 
-        try:
-            terminal_status = self._run_loop()
-        except Exception as exc:
-            log.exception("Session %d crashed: %s", self._session_id, exc)
-            terminal_status = SESSION_STATUS_ERROR_STREAK
-        finally:
-            self._transcript_file.close()
-
-        tick_end = self._tick_counter[0]
-        summary = self._build_summary(terminal_status)
-
-        return SessionResult(
-            session_id=self._session_id,
-            goal_id=self._task.goal_id,
-            task=self._task,
-            status=terminal_status,
-            summary=summary,
-            tick_start=tick_start,
-            tick_end=tick_end,
-            action_count=self._action_count,
-            tokens_used=self._tokens_used,
-            transcript_path=str(self._transcript_path),
-        )
-
-    # ── Inner loop ─────────────────────────────────────────────────────────
-
-    def _run_loop(self) -> str:
         while True:
-            # Check context size before calling LLM
-            if self._needs_compression():
-                compressed = self._compress_context()
-                if not compressed:
-                    # Compression failed or we're already at min size
-                    return SESSION_STATUS_CONTEXT_OVERFLOW
+            # Proactive compression before calling the LLM
+            self._maybe_compress()
 
             # Call the LLM
             try:
                 response = self._llm.chat(
                     messages=self._messages,
-                    tools=worker_char.WORKER_TOOL_SCHEMAS,
-                    tool_choice="auto",
-                    temperature=0.7,
+                    tools=WORKER_TOOL_SCHEMAS,
+                    tool_choice="required",
+                    temperature=0.3,
                 )
             except Exception as exc:
-                log.error("LLM call failed in session %d: %s", self._session_id, exc)
-                return SESSION_STATUS_ERROR_STREAK
-
-            self._tokens_used += response.usage.total_tokens
-
-            # No tool calls → model produced text only (unusual but handle it)
-            if not response.tool_calls:
-                log.warning(
-                    "Session %d: LLM returned no tool calls — "
-                    "appending as assistant message and continuing",
-                    self._session_id,
+                exc_str = str(exc).lower()
+                if any(p in exc_str for p in _CONTEXT_OVERFLOW_PATTERNS):
+                    log.warning("LLM context overflow at tick %d: %s", tick_id, exc)
+                    return self._end_session(
+                        tick_id=tick_id,
+                        status="context_overflow",
+                        summary=(
+                            f"Context overflow at action {self._action_count}. "
+                            f"Try compressing earlier (lower context_compress_threshold_tokens "
+                            f"or reduce max_read_chars)."
+                        ),
+                    )
+                log.error("Worker LLM call failed at tick %d: %s", tick_id, exc)
+                return self._end_session(
+                    tick_id=tick_id,
+                    status="error",
+                    summary=f"LLM call failed: {exc}",
                 )
-                self._messages.append({
-                    "role": "assistant",
-                    "content": response.content or "",
-                })
-                continue
 
-            # Build the assistant message with tool calls for the conversation
-            assistant_msg = self._build_assistant_message(response)
-            self._messages.append(assistant_msg)
+            # Handle tool calls
+            if not response.tool_calls:
+                # No tool call — treat as stuck
+                log.warning("Worker produced no tool calls at tick %d", tick_id)
+                return self._end_session(
+                    tick_id=tick_id,
+                    status="stuck",
+                    summary="No tool calls returned — model may be confused.",
+                )
 
-            # Execute each tool call
-            tool_result_messages: list[dict] = []
+            # Append assistant message
+            self._messages.append(_build_assistant_msg(response))
+
+            # Process each tool call
             for tc in response.tool_calls:
-                tick = self._tick_counter[0]
-
-                # ── finish() is intercepted here ─────────────────────────
-                if tc.name == "finish":
-                    self._finish_summary = tc.arguments.get("summary", "")
-                    self._finish_status = tc.arguments.get("status", "done")
-                    self._log_tick(
-                        tick,
-                        action_type="finish",
-                        summary=f"finish({self._finish_status}): {self._finish_summary[:100]}",
-                        outcome=OUTCOME_OK,
-                    )
-                    self._tick_counter[0] += 1
-                    # Append tool result so conversation is well-formed
-                    tool_result_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.call_id,
-                        "content": "Session ending.",
-                    })
-                    # Don't execute any more tool calls this turn
-                    self._messages.append(
-                        {"role": "tool", "content": json.dumps(tool_result_messages)}
-                        if len(tool_result_messages) > 1
-                        else tool_result_messages[0]
-                    )
-                    # Map finish status to session status
-                    return {
-                        "done": SESSION_STATUS_DONE,
-                        "stuck": SESSION_STATUS_STUCK,
-                        "error": SESSION_STATUS_ERROR_STREAK,
-                    }.get(self._finish_status, SESSION_STATUS_DONE)
-
-                # ── Regular tool execution ────────────────────────────────
-                result = self._tools.execute(tc.name, tc.arguments)
                 self._action_count += 1
 
-                # Track errors
+                # finish() is special — end the session
+                if tc.name == "finish":
+                    args = tc.arguments
+                    status = args.get("status", "done")
+                    summary = args.get("summary", "")
+                    self._log_tick(
+                        tick_id=tick_id,
+                        action_type="finish",
+                        summary=f"finish({status}): {summary[:120]}",
+                        outcome=OUTCOME_OK,
+                    )
+                    return self._end_session(
+                        tick_id=tick_id,
+                        status=status,
+                        summary=summary,
+                    )
+
+                # Execute the tool
+                result = self._executor.execute(tc.name, tc.arguments)
+                outcome = OUTCOME_ERROR if result.is_error else OUTCOME_OK
+
                 if result.is_error:
                     self._consecutive_errors += 1
                 else:
                     self._consecutive_errors = 0
 
-                # Log tick
-                summary_line = f"{tc.name}({_arg_preview(tc.arguments)}): {result.output[:80]}"
+                # Log to DB + transcript
                 self._log_tick(
-                    tick,
+                    tick_id=tick_id,
                     action_type=tc.name,
-                    summary=summary_line,
-                    outcome=OUTCOME_ERROR if result.is_error else OUTCOME_OK,
+                    summary=f"{tc.name}({_args_preview(tc.arguments)}) → {result.output[:80]}",
+                    outcome=outcome,
+                )
+                self._transcript_entries.append(
+                    format_tool_call_for_transcript(
+                        tc.name, tc.arguments, result, tick_id
+                    )
                 )
 
-                # Write to transcript
-                self._write_transcript(
-                    format_tool_call_for_transcript(tc.name, tc.arguments, result, tick)
-                )
-
-                # Append tool result for LLM
-                tool_result_messages.append(
+                # Append tool result to conversation
+                self._messages.append(
                     format_tool_result_for_llm(tc.call_id, result)
                 )
 
-                self._tick_counter[0] += 1
+                tick_id += 1
 
-            # Add all tool results to conversation
-            self._messages.extend(tool_result_messages)
+                # Check termination conditions
+                if self._action_count >= self._config.max_actions_per_session:
+                    log.info(
+                        "Worker hit max_actions_per_session (%d) at tick %d",
+                        self._config.max_actions_per_session, tick_id,
+                    )
+                    return self._end_session(
+                        tick_id=tick_id,
+                        status="max_actions",
+                        summary=(
+                            f"Reached action limit ({self._config.max_actions_per_session}). "
+                            "Work was partial."
+                        ),
+                    )
 
-            # ── Guardrail checks ──────────────────────────────────────────
-            if self._consecutive_errors >= self._config.max_consecutive_errors:
-                log.warning(
-                    "Session %d: %d consecutive errors — ending session",
-                    self._session_id, self._consecutive_errors,
-                )
-                return SESSION_STATUS_ERROR_STREAK
+                if self._consecutive_errors >= self._config.max_consecutive_errors:
+                    log.warning(
+                        "Worker hit max_consecutive_errors (%d) at tick %d",
+                        self._config.max_consecutive_errors, tick_id,
+                    )
+                    return self._end_session(
+                        tick_id=tick_id,
+                        status="max_errors",
+                        summary=(
+                            f"{self._consecutive_errors} consecutive errors. "
+                            "Ending session to avoid thrashing."
+                        ),
+                    )
 
-            if self._action_count >= self._config.max_actions_per_session:
-                log.info(
-                    "Session %d: reached max_actions (%d)",
-                    self._session_id, self._config.max_actions_per_session,
-                )
-                return SESSION_STATUS_MAX_ACTIONS
+    # ── Initialisation ─────────────────────────────────────────────────────
 
-    # ── Context compression ────────────────────────────────────────────────
+    def _init_messages(self) -> None:
+        self._messages = [
+            {"role": "system", "content": worker_char.SYSTEM_PROMPT},
+            *worker_context.build(
+                goal=self._goal,
+                task=self._task,
+                workspace=self._workspace,
+                db=self._db,
+                attempt=self._attempt,
+                previous_summary=self._prev_summary,
+            ),
+        ]
 
-    def _needs_compression(self) -> bool:
-        estimated = LLMClient.estimate_tokens(self._messages)
-        return estimated >= self._config.context_compress_threshold_tokens
+    # ── Compression ────────────────────────────────────────────────────────
 
-    def _compress_context(self) -> bool:
+    def _maybe_compress(self) -> None:
         """
-        Compress the middle of the conversation using the Summarizer.
-        Keeps _COMPRESS_HEAD messages at start and _COMPRESS_TAIL at end.
-        Returns True if compression happened, False if not possible.
-        """
-        if len(self._messages) <= _COMPRESS_HEAD + _COMPRESS_TAIL + 2:
-            log.warning("Session %d: context too large but cannot compress further",
-                        self._session_id)
-            return False
+        If the conversation is approaching the context limit, compress the
+        middle messages using the Summarizer.
 
-        head = self._messages[:_COMPRESS_HEAD]
-        tail = self._messages[-_COMPRESS_TAIL:]
-        middle = self._messages[_COMPRESS_HEAD:-_COMPRESS_TAIL]
+        The threshold is config.effective_compress_threshold(), which
+        defaults to 60 % of context_length_tokens.
+        """
+        threshold = self._config.effective_compress_threshold()
+        if threshold <= 0:
+            return
+
+        # Estimate current token count from message content length
+        total_chars = sum(len(str(m.get("content") or "")) for m in self._messages)
+        estimated_tokens = total_chars // 4  # ~4 chars/token heuristic
+
+        if estimated_tokens < threshold:
+            return
 
         log.info(
-            "Session %d: compressing %d messages in the middle",
-            self._session_id, len(middle),
+            "Worker context at ~%d tokens (threshold %d) — compressing",
+            estimated_tokens, threshold,
         )
 
-        compress_messages = sum_char.compress_prompt(middle)
-        try:
-            response = self._llm.chat(compress_messages, temperature=0.2)
-            summary_text = response.content or "(compression produced no output)"
-        except Exception as exc:
-            log.error("Compression LLM call failed: %s", exc)
-            return False
+        # Keep: system (0), task context (1), last few exchanges
+        # Compress: middle messages [2 .. -(KEEP_TAIL*2)]
+        keep_tail = 6  # keep last 6 message pairs (assistant + tool result)
+        keep_start = 2  # system + context
 
-        summary_msg = {
+        if len(self._messages) <= keep_start + keep_tail * 2:
+            return  # not enough messages to usefully compress
+
+        to_compress = self._messages[keep_start : -keep_tail]
+        tail = self._messages[-keep_tail:]
+
+        try:
+            compress_msgs = sum_char.compress_prompt(to_compress)
+            response = self._llm.chat(compress_msgs, temperature=0.2)
+            summary_text = response.content or "(no summary)"
+        except Exception as exc:
+            log.error("Context compression failed: %s", exc)
+            return
+
+        compressed_msg: dict[str, Any] = {
             "role": "user",
             "content": (
-                f"[Session history summary — {len(middle)} messages compressed]\n\n"
+                f"[Context compressed — earlier actions summarised]\n\n"
                 f"{summary_text}"
             ),
         }
-        self._messages = head + [summary_msg] + tail
-        log.info("Session %d: context compressed successfully", self._session_id)
-        return True
+
+        self._messages = (
+            self._messages[:keep_start] + [compressed_msg] + tail
+        )
+        log.info("Context compressed: %d → %d messages", len(to_compress), 1)
+
+    # ── Session finalisation ───────────────────────────────────────────────
+
+    def _end_session(
+        self, tick_id: int, status: str, summary: str
+    ) -> SessionResult:
+        # Write out transcript
+        transcript_path = self._workspace.transcript_path(
+            self._goal.workspace_path, self._session_id
+        )
+        if self._transcript_entries:
+            try:
+                transcript_path.parent.mkdir(parents=True, exist_ok=True)
+                with transcript_path.open("w") as f:
+                    for line in self._transcript_entries:
+                        f.write(line + "\n")
+            except Exception as exc:
+                log.error("Failed to write transcript: %s", exc)
+
+        return SessionResult(
+            session_id=self._session_id,
+            goal_id=self._goal.goal_id,
+            task=self._task,
+            status=status,
+            summary=summary,
+            tick_end=tick_id,
+            action_count=self._action_count,
+            tokens_used=self._tokens_used,
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -312,58 +338,39 @@ class WorkerSession:
             self._db.log_tick(TickRecord(
                 tick_id=tick_id,
                 session_id=self._session_id,
-                goal_id=self._task.goal_id,
+                goal_id=self._goal.goal_id,
                 actor=ACTOR_WORKER,
                 action_type=action_type,
-                summary=summary[:200],
+                summary=summary,
                 outcome=outcome,
             ))
         except Exception as exc:
-            # DB write failure must not crash the session
             log.error("Failed to log tick %d: %s", tick_id, exc)
 
-    def _write_transcript(self, line: str) -> None:
-        try:
-            self._transcript_file.write(line + "\n")
-            self._transcript_file.flush()
-        except Exception as exc:
-            log.error("Failed to write transcript: %s", exc)
 
-    def _build_summary(self, status: str) -> str:
-        if self._finish_summary:
-            return self._finish_summary
-        # Auto-generate a minimal summary from status
-        return (
-            f"Session ended with status '{status}' after "
-            f"{self._action_count} tool calls."
-        )
+# ── Message formatting helpers ─────────────────────────────────────────────
 
-    @staticmethod
-    def _build_assistant_message(response) -> dict[str, Any]:
-        """Build an OpenAI-format assistant message dict with tool_calls."""
-        tool_calls_raw = []
-        for tc in response.tool_calls:
-            tool_calls_raw.append({
-                "id": tc.call_id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": json.dumps(tc.arguments),
-                },
-            })
-        return {
-            "role": "assistant",
-            "content": response.content or None,
-            "tool_calls": tool_calls_raw,
-        }
+def _build_assistant_msg(response) -> dict[str, Any]:
+    tool_calls_raw = []
+    for tc in response.tool_calls:
+        tool_calls_raw.append({
+            "id": tc.call_id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": json.dumps(tc.arguments),
+            },
+        })
+    return {
+        "role": "assistant",
+        "content": response.content or None,
+        "tool_calls": tool_calls_raw,
+    }
 
 
-def _arg_preview(args: dict) -> str:
-    """One-line preview of tool arguments for logging."""
+def _args_preview(args: dict) -> str:
     parts = []
-    for k, v in args.items():
-        v_str = str(v)
-        if len(v_str) > 40:
-            v_str = v_str[:40] + "…"
+    for k, v in list(args.items())[:2]:
+        v_str = str(v)[:40].replace("\n", "↵")
         parts.append(f"{k}={v_str!r}")
     return ", ".join(parts)

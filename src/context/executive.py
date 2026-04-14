@@ -2,14 +2,18 @@
 Build the Executive's briefing — what the Executive sees each tick.
 
 Design constraints (for long-running scaling):
-  - Active goals: full detail (checkpoint + last session summary)
-  - Non-active goals: one-line summary only
+  - Active goals: capped at _MAX_ACTIVE_GOALS shown (full detail each)
+  - Non-active goals: capped at _MAX_NONTERMINAL_GOALS (one-liner each)
   - Done/abandoned goals: just a count
   - Recent decisions: last 10 Executive ticks from DB
-  - Inbox: all unhandled messages (expected to be small; gateway archives old ones)
+  - PRIORITIES.md: included truncated (strategic rationale)
+  - Last N reflections: truncated snippet (Executive awareness)
+  - No last-session-summary: available on demand via read_checkpoint /
+    list_sessions query tools
 
+All lists are entry-capped; no unbounded content enters the briefing.
 The briefing is built fresh every Executive tick from DB + filesystem state.
-Nothing is cached.  Context size stays bounded regardless of tick count.
+Nothing is cached.
 """
 
 from __future__ import annotations
@@ -18,11 +22,13 @@ from ..db import Database
 from ..models import Goal, HealthIssue, SessionResult, GOAL_STATUS_ACTIVE
 from ..workspace import Workspace
 
-
-# Max characters for a checkpoint shown in the Executive briefing.
-# If longer, it's truncated.  Full checkpoint is on disk.
-_MAX_CHECKPOINT_CHARS = 1500
-_MAX_RECENT_TICKS = 10
+# ── Caps ───────────────────────────────────────────────────────────────────
+_MAX_ACTIVE_GOALS       = 20    # active goals shown in full
+_MAX_NONTERMINAL_GOALS  = 20    # paused/blocked goals shown as one-liners
+_MAX_RECENT_TICKS       = 10    # recent executive decisions
+_MAX_CHECKPOINT_CHARS   = 1_500 # truncation for checkpoint in briefing
+_MAX_PRIORITIES_CHARS   = 2_000 # truncation for PRIORITIES.md in briefing
+_MAX_REFLECTIONS        = 3     # recent reflections shown as one-liners
 
 
 def build(
@@ -49,17 +55,17 @@ def build(
             lines.append(f"- [{msg['id']}] {msg['text']}")
         sections.append("\n".join(lines))
 
-    # ── Last session result ────────────────────────────────────────────────
+    # ── Last session result (status only — no duplicate detail) ────────────
     if last_result:
         goal = db.get_goal(last_result.goal_id)
         goal_title = goal.title if goal else last_result.goal_id
         result_block = (
-            f"## Last Worker Session Result\n"
+            f"## Last Worker Session\n"
             f"- **Goal:** {goal_title} ({last_result.goal_id})\n"
             f"- **Task:** {last_result.task.description}\n"
             f"- **Outcome:** `{last_result.status}`\n"
             f"- **Summary:** {last_result.summary}\n"
-            f"- **Ticks used:** {last_result.tick_end - last_result.tick_start}"
+            f"_(Use list_sessions or read_checkpoint for full detail.)_"
         )
         sections.append(result_block)
 
@@ -81,26 +87,39 @@ def build(
     ]
     terminal_count = counts.get("done", 0) + counts.get("abandoned", 0)
 
-    # Active goals — full detail
+    # Active goals — full detail, capped
     if active:
+        shown_active = active[:_MAX_ACTIVE_GOALS]
+        hidden_active = len(active) - len(shown_active)
         lines = [f"## Active Goals ({len(active)})"]
-        for g in active:
-            lines.append(_format_active_goal(g, db, workspace))
+        for g in shown_active:
+            lines.append(_format_active_goal(g, workspace))
+        if hidden_active:
+            lines.append(
+                f"\n_...{hidden_active} more active goal(s) not shown. "
+                "Use read_checkpoint(goal_id) to inspect them._"
+            )
         sections.append("\n".join(lines))
     else:
         sections.append("## Active Goals\n_(none)_")
 
-    # Paused / blocked goals — one-liner
+    # Paused / blocked goals — one-liner, capped
     if non_terminal:
+        shown_nt = non_terminal[:_MAX_NONTERMINAL_GOALS]
+        hidden_nt = len(non_terminal) - len(shown_nt)
         lines = [f"## Paused / Blocked Goals ({len(non_terminal)})"]
-        for g in non_terminal:
+        for g in shown_nt:
             reason = f" — {g.blocked_reason}" if g.blocked_reason else ""
             lines.append(f"- `{g.goal_id}` [{g.status}] **{g.title}**{reason}")
+        if hidden_nt:
+            lines.append(f"- _...{hidden_nt} more not shown_")
         sections.append("\n".join(lines))
 
     # Terminal goals — just a count
     if terminal_count:
-        sections.append(f"## Completed / Abandoned Goals\n{terminal_count} total (see DB or archive)")
+        sections.append(
+            f"## Completed / Abandoned Goals\n{terminal_count} total (see DB or archive)"
+        )
 
     # ── Recent Executive decisions ─────────────────────────────────────────
     recent = db.get_recent_ticks(n=_MAX_RECENT_TICKS)
@@ -112,14 +131,23 @@ def build(
             lines.append(f"- {icon} tick {t.tick_id}: {t.summary}")
         sections.append("\n".join(lines))
 
-    # ── Reflector observations (if any recent) ─────────────────────────────
-    reflector_ticks = [t for t in db.get_recent_ticks(n=50) if t.actor == "reflector"]
-    if reflector_ticks:
-        last_reflect = reflector_ticks[-1]
-        sections.append(
-            f"## Last Reflector Pass (tick {last_reflect.tick_id})\n"
-            f"{last_reflect.summary}"
-        )
+    # ── PRIORITIES.md (strategic rationale) ───────────────────────────────
+    priorities = workspace.read_priorities()
+    if priorities:
+        if len(priorities) > _MAX_PRIORITIES_CHARS:
+            priorities = priorities[:_MAX_PRIORITIES_CHARS] + "\n...[truncated — use read_knowledge to see more]"
+        sections.append(f"## Current Priorities\n{priorities}")
+
+    # ── Recent reflections (summaries) ────────────────────────────────────
+    recent_reflections = db.get_recent_reflections(_MAX_REFLECTIONS)
+    if recent_reflections:
+        lines = [f"## Recent Reflections (last {len(recent_reflections)})"]
+        for r in recent_reflections:
+            lines.append(
+                f"- tick {r['tick']} ({r['trigger_reason']}): {r['summary'] or '(no summary)'}"
+            )
+        lines.append("_(Use read_reflection() for full content.)_")
+        sections.append("\n".join(lines))
 
     briefing = "\n\n---\n\n".join(sections)
     return [{"role": "user", "content": briefing}]
@@ -127,28 +155,20 @@ def build(
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def _format_active_goal(g: Goal, db: Database, workspace: Workspace) -> str:
+def _format_active_goal(g: Goal, workspace: Workspace) -> str:
     lines = [
         f"\n### [{g.priority}] {g.title} (`{g.goal_id}`)",
         f"**Description:** {g.description}",
         f"**Total ticks:** {g.total_ticks}  |  **Last worked:** tick {g.last_worked_tick}",
     ]
 
-    # Checkpoint
+    # Checkpoint (truncated)
     checkpoint = workspace.read_checkpoint(g.workspace_path)
     if checkpoint:
         if len(checkpoint) > _MAX_CHECKPOINT_CHARS:
-            checkpoint = checkpoint[:_MAX_CHECKPOINT_CHARS] + "\n...[truncated]"
+            checkpoint = checkpoint[:_MAX_CHECKPOINT_CHARS] + "\n...[truncated — use read_checkpoint() for full]"
         lines.append(f"**Checkpoint:**\n```\n{checkpoint}\n```")
     else:
         lines.append("**Checkpoint:** _(none yet)_")
-
-    # Last session for this goal
-    recent_sessions = db.get_recent_sessions(n=1, goal_id=g.goal_id)
-    if recent_sessions:
-        s = recent_sessions[0]
-        lines.append(
-            f"**Last session:** `{s['status']}` — {s.get('summary', '(no summary)')}"
-        )
 
     return "\n".join(lines)

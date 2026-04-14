@@ -7,11 +7,13 @@ The Executive is the only character that:
   - Makes resource-allocation decisions
   - Knows about health issues and reflector observations
 
-It does NOT execute any tools itself.  It produces a list of actions that
-the infrastructure (loop/actions.py) carries out.
+It operates in a two-phase loop each tick:
+  1. Query phase — call read-only query tools to gather more detail
+  2. Decision phase — call action tools to produce decisions
 
-The Executive may produce MULTIPLE actions per tick (e.g., respond to a
-user message AND create a new goal AND assign a task — all in one call).
+Query tools never mutate state; action tools always do.
+The infrastructure runs the query loop until either an action tool is called
+or max_executive_queries is reached, then executes the actions.
 """
 
 from __future__ import annotations
@@ -24,6 +26,24 @@ from ..models import ExecutiveAction, EXEC_TOOLS
 
 log = logging.getLogger(__name__)
 
+# ── Tool name constants ────────────────────────────────────────────────────
+
+# Query tools (read-only, no state mutation)
+EXEC_QUERY_READ_CHECKPOINT = "read_checkpoint"
+EXEC_QUERY_READ_JOURNAL    = "read_journal"
+EXEC_QUERY_READ_KNOWLEDGE  = "read_knowledge"
+EXEC_QUERY_SEARCH_KNOWLEDGE = "search_knowledge"
+EXEC_QUERY_LIST_SESSIONS   = "list_sessions"
+EXEC_QUERY_READ_REFLECTION = "read_reflection"
+
+EXEC_QUERY_TOOLS = {
+    EXEC_QUERY_READ_CHECKPOINT,
+    EXEC_QUERY_READ_JOURNAL,
+    EXEC_QUERY_READ_KNOWLEDGE,
+    EXEC_QUERY_SEARCH_KNOWLEDGE,
+    EXEC_QUERY_LIST_SESSIONS,
+    EXEC_QUERY_READ_REFLECTION,
+}
 
 # ── System prompt ─────────────────────────────────────────────────────────
 
@@ -51,12 +71,140 @@ Operating principles:
 - If a Worker session ended with 'max_actions' or 'context_overflow', \
   continue the same task — work was partial.
 
-You can call multiple tools in a single response. They are executed in order.
+You work in two phases each tick:
+1. QUERY — call read-only query tools to get more detail before deciding. \
+   Use these when the briefing summary is not enough to make a good decision.
+2. DECIDE — call one or more action tools. Once you call an action tool, \
+   the tick ends.
+
+You can call multiple action tools in a single response. They are executed \
+in order.
 """
 
-# ── Tool schemas ──────────────────────────────────────────────────────────
+# ── Query tool schemas ─────────────────────────────────────────────────────
 
-TOOL_SCHEMAS: list[dict[str, Any]] = [
+QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_checkpoint",
+            "description": (
+                "Read the full CHECKPOINT.md for a goal. "
+                "Use this when the truncated checkpoint in the briefing is not enough."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {
+                        "type": "string",
+                        "description": "ID of the goal to read the checkpoint for.",
+                    }
+                },
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_journal",
+            "description": "Read recent journal entries for a specific goal.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {
+                        "type": "string",
+                        "description": "ID of the goal.",
+                    },
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of recent journal entries to read (default 3, max 10).",
+                    },
+                },
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_knowledge",
+            "description": "Read the full content of a knowledge file by topic name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "The knowledge topic (file stem), e.g. 'nginx'.",
+                    }
+                },
+                "required": ["topic"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge",
+            "description": "Full-text search across all knowledge files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword query to search for.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sessions",
+            "description": "List recent Worker sessions for a goal, with status and summary.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {
+                        "type": "string",
+                        "description": "ID of the goal.",
+                    },
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of recent sessions to return (default 5, max 20).",
+                    },
+                },
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_reflection",
+            "description": (
+                "Read the content of recent reflection entries. "
+                "Useful when you need the full strategic analysis from a past reflection."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "description": "Number of recent reflections to read (default 2, max 5).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+# ── Action tool schemas ────────────────────────────────────────────────────
+
+ACTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -196,12 +344,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+# Combined schema list: queries first, then actions
+ALL_TOOL_SCHEMAS: list[dict[str, Any]] = QUERY_TOOL_SCHEMAS + ACTION_TOOL_SCHEMAS
 
 # ── Response parsing ───────────────────────────────────────────────────────
 
 def parse_actions(tool_calls: list) -> list[ExecutiveAction]:
     """
     Convert LLM tool calls into ExecutiveAction objects.
+    Only processes action tools; query tools are handled by the loop.
     Unknown tool names are logged and skipped.
     """
     actions: list[ExecutiveAction] = []

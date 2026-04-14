@@ -8,12 +8,15 @@ Runs tick-based maintenance operations that keep the system scalable:
 
   Every journal_interval ticks:
     Write a journal entry for each active goal (ticks → Summarizer → .md)
+    Index in journal_index DB table.
 
   Every reflection_interval ticks (or on demand):
     Run the Reflector — re-evaluate priorities, distil knowledge
+    Write individual reflection file + index in reflection_index DB table.
 
   Every weekly_summary_interval ticks:
     Summarise recent journal entries into a weekly summary doc
+    Index in weekly_index DB table.
 
   Every archive_interval ticks:
     Archive old ticks from DB → JSONL on disk
@@ -61,7 +64,8 @@ class Consolidation:
         self._db = db
         self._workspace = workspace
         self._llm = llm
-        self._reflection_requested = False   # set by main loop on Executive request
+        self._reflection_requested = False
+        self._reflection_reason = ""
 
     def request_reflection(self, reason: str) -> None:
         """Called by the main loop when the Executive requests reflection."""
@@ -89,8 +93,7 @@ class Consolidation:
 
         # Reflection (scheduled or on demand)
         if current_tick % cfg.reflection_interval == 0 or self._reflection_requested:
-            reason = getattr(self, "_reflection_reason", "periodic") \
-                if self._reflection_requested else "periodic"
+            reason = self._reflection_reason if self._reflection_requested else "periodic"
             self._run_reflection(current_tick, reason)
             self._reflection_requested = False
             self._reflection_reason = ""
@@ -134,6 +137,7 @@ class Consolidation:
         """
         For each active goal, summarise recent ticks into a journal entry.
         Uses ticks since the last journal entry.
+        Index entry stored in journal_index DB table.
         """
         journal_interval = self._config.journal_interval
         tick_start = current_tick - journal_interval
@@ -150,35 +154,58 @@ class Consolidation:
             try:
                 response = self._llm.chat(messages, temperature=0.3)
                 journal_text = response.content or ""
-                if journal_text:
-                    self._workspace.append_journal(
-                        goal.workspace_path, tick_start, tick_end, journal_text
-                    )
-                    self._db.log_tick(TickRecord(
-                        tick_id=current_tick,
-                        session_id=None,
-                        goal_id=goal.goal_id,
-                        actor=ACTOR_SUMMARIZER,
-                        action_type="journal",
-                        summary=f"Wrote journal entry ticks {tick_start}-{tick_end}",
-                        outcome=OUTCOME_OK,
-                    ))
-                    log.info("Wrote journal entry for %s", goal.goal_id)
+                if not journal_text:
+                    continue
+
+                journal_path = self._workspace.append_journal(
+                    goal.workspace_path, tick_start, tick_end, journal_text
+                )
+
+                # Build one-line summary: first non-empty, non-heading line
+                summary_line = next(
+                    (
+                        line.strip()
+                        for line in journal_text.splitlines()
+                        if line.strip() and not line.startswith("#")
+                    ),
+                    "",
+                )[:120]
+
+                # Relative path for DB index
+                rel_path = str(journal_path.relative_to(self._workspace.root))
+                self._db.upsert_journal(
+                    goal_id=goal.goal_id,
+                    tick_start=tick_start,
+                    tick_end=tick_end,
+                    file_path=rel_path,
+                    summary=summary_line,
+                )
+                self._db.log_tick(TickRecord(
+                    tick_id=current_tick,
+                    session_id=None,
+                    goal_id=goal.goal_id,
+                    actor=ACTOR_SUMMARIZER,
+                    action_type="journal",
+                    summary=f"Wrote journal entry ticks {tick_start}-{tick_end}",
+                    outcome=OUTCOME_OK,
+                ))
+                log.info("Wrote journal entry for %s", goal.goal_id)
             except Exception as exc:
                 log.error("Journal entry failed for %s: %s", goal.goal_id, exc)
 
     def _write_weekly_summary(self, current_tick: int) -> None:
         """
         Collect recent journal entries across all goals and write a weekly summary.
+        Index entry stored in weekly_index DB table.
         """
         all_entries: list[str] = []
         active_goals = self._db.get_active_goals()
         for goal in active_goals:
-            entries = self._workspace.read_recent_journals(goal.workspace_path, n=5)
-            if entries:
-                all_entries.extend(
-                    [f"### {goal.title} ({goal.goal_id})\n{e}" for e in entries]
-                )
+            db_entries = self._db.get_recent_journals(goal.goal_id, n=5)
+            for e in db_entries:
+                content = self._workspace.read_journal_file(e["file_path"])
+                if content:
+                    all_entries.append(f"### {goal.title} ({goal.goal_id})\n{content}")
 
         if not all_entries:
             log.debug("No journal entries for weekly summary at tick %d", current_tick)
@@ -188,24 +215,43 @@ class Consolidation:
         try:
             response = self._llm.chat(messages, temperature=0.3)
             weekly_text = response.content or ""
-            if weekly_text:
-                self._workspace.write_weekly_summary(current_tick, weekly_text)
-                self._db.log_tick(TickRecord(
-                    tick_id=current_tick,
-                    session_id=None,
-                    goal_id=None,
-                    actor=ACTOR_SUMMARIZER,
-                    action_type="weekly_summary",
-                    summary=f"Wrote weekly summary at tick {current_tick}",
-                    outcome=OUTCOME_OK,
-                ))
-                log.info("Wrote weekly summary at tick %d", current_tick)
+            if not weekly_text:
+                return
+
+            weekly_path = self._workspace.write_weekly_summary(current_tick, weekly_text)
+
+            summary_line = next(
+                (
+                    line.strip()
+                    for line in weekly_text.splitlines()
+                    if line.strip() and not line.startswith("#")
+                ),
+                "",
+            )[:120]
+
+            rel_path = str(weekly_path.relative_to(self._workspace.root))
+            self._db.upsert_weekly(
+                tick=current_tick,
+                file_path=rel_path,
+                summary=summary_line,
+            )
+            self._db.log_tick(TickRecord(
+                tick_id=current_tick,
+                session_id=None,
+                goal_id=None,
+                actor=ACTOR_SUMMARIZER,
+                action_type="weekly_summary",
+                summary=f"Wrote weekly summary at tick {current_tick}",
+                outcome=OUTCOME_OK,
+            ))
+            log.info("Wrote weekly summary at tick %d", current_tick)
         except Exception as exc:
             log.error("Weekly summary failed: %s", exc)
 
     def _run_reflection(self, current_tick: int, reason: str) -> None:
         """
-        Run the Reflector character.  Applies any updates it produces.
+        Run the Reflector character.  Writes a per-tick reflection file and
+        indexes it in reflection_index.  Applies any structural updates it produces.
         """
         log.info("Running Reflector at tick %d (reason: %s)", current_tick, reason)
 
@@ -252,7 +298,6 @@ class Consolidation:
         for ku in result.knowledge_updates:
             try:
                 path = self._workspace.write_knowledge(ku.topic, ku.content)
-                # One-line summary: first non-empty, non-heading line
                 summary_line = next(
                     (
                         line.strip()
@@ -279,16 +324,32 @@ class Consolidation:
             except Exception as exc:
                 log.error("Failed to write PRIORITIES.md: %s", exc)
 
-        # Append observations to REFLECTIONS.md
-        if result.observations:
-            try:
-                header = f"## Reflection at tick {current_tick} ({reason})\n\n"
-                self._workspace.append_reflection(header + result.observations)
-            except Exception as exc:
-                log.error("Failed to append reflection: %s", exc)
+        # Write per-tick reflection file and index it
+        observations = result.observations or ""
+        header = f"## Reflection at tick {current_tick} ({reason})\n\n"
+        full_content = header + observations
+        try:
+            reflection_path = self._workspace.write_reflection(current_tick, full_content)
+            summary_line = next(
+                (
+                    line.strip()
+                    for line in observations.splitlines()
+                    if line.strip() and not line.startswith("#")
+                ),
+                "",
+            )[:120]
+            rel_path = str(reflection_path.relative_to(self._workspace.root))
+            self._db.upsert_reflection(
+                tick=current_tick,
+                trigger_reason=reason,
+                file_path=rel_path,
+                summary=summary_line,
+            )
+        except Exception as exc:
+            log.error("Failed to write reflection file: %s", exc)
 
         # Log the reflection tick
-        obs_preview = result.observations[:100] if result.observations else "no observations"
+        obs_preview = observations[:100] if observations else "no observations"
         self._db.log_tick(TickRecord(
             tick_id=current_tick,
             session_id=None,
@@ -307,7 +368,7 @@ class Consolidation:
 
     def _archive_old_data(self, current_tick: int) -> None:
         """
-        Archive old ticks from DB → compressed JSONL on disk.
+        Archive old ticks from DB → JSONL on disk.
         Compress session transcripts older than archive_interval ticks.
         """
         archive_before = current_tick - self._config.archive_interval
@@ -332,7 +393,7 @@ class Consolidation:
         except Exception as exc:
             log.error("Tick archival failed: %s", exc)
 
-        # Compress old session transcripts (all completed .jsonl files)
+        # Compress old session transcripts
         all_goals = self._db.get_all_goals()
         for goal in all_goals:
             sessions_dir = self._workspace.abs(goal.workspace_path) / "sessions"
