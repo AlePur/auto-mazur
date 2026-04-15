@@ -165,6 +165,9 @@ class LLMClient:
 
     # ── Internal ───────────────────────────────────────────────────────────
 
+    # How long to sleep between attempts in the vLLM-unreachable recovery loop.
+    _CONNECT_RETRY_INTERVAL = 5 * 60  # 5 minutes
+
     def _call_with_retry(self, body: dict[str, Any]) -> dict[str, Any]:
         last_exc: Exception | None = None
         for attempt in range(self._cfg.max_retries):
@@ -203,6 +206,37 @@ class LLMClient:
                 last_exc = exc
             except httpx.HTTPStatusError:
                 raise  # 4xx are not retried
+
+        # All short retries exhausted.  If the root cause is a connection error
+        # (vLLM server unreachable) enter an infinite recovery loop rather than
+        # propagating — a ConnectError cascading through the main loop would
+        # just spam the logs with tracebacks on every tick.
+        if isinstance(last_exc, httpx.ConnectError):
+            log.error(
+                "vLLM server unreachable after %d attempts — "
+                "entering 5-minute retry loop (will keep trying until it comes back)",
+                self._cfg.max_retries,
+            )
+            while True:
+                time.sleep(self._CONNECT_RETRY_INTERVAL)
+                try:
+                    response = self._http.post("/chat/completions", json=body)
+                    if response.status_code in _RETRYABLE_STATUS:
+                        log.warning(
+                            "vLLM recovery attempt: HTTP %d — will retry in 5 min",
+                            response.status_code,
+                        )
+                        continue
+                    response.raise_for_status()
+                    log.info("vLLM reconnected — resuming normal operation")
+                    return response.json()
+                except httpx.ConnectError as exc:
+                    log.warning("vLLM still unreachable — will retry in 5 min: %s", exc)
+                except Exception:
+                    # Any non-connection error (timeout, 4xx, …) breaks out and
+                    # propagates so the caller handles it normally.
+                    raise
+
         raise last_exc or RuntimeError("LLM call failed after all retries")
 
     def _parse_response(self, raw: dict[str, Any]) -> LLMResponse:

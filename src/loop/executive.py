@@ -58,7 +58,7 @@ class ExecutiveTick:
         self._config = config
         self._llm = llm
         self._db = db
-        self._store = workspace
+        self._store = store
         self._guard = TurnGuard(
             llm=self._llm,
             policy=TurnPolicy(max_no_tool_retries=1),
