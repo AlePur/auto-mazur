@@ -71,7 +71,10 @@
       version = "0.1.0";
 
       # The git root contains pyproject.toml and the src/ package.
-      src = self;
+      # Because this flake lives in the flake/ subdirectory, self.outPath
+      # resolves to the flake/ dir inside the store copy of the repo.
+      # dirOf self.outPath gives the repo root where pyproject.toml lives.
+      src = /. + builtins.unsafeDiscardStringContext (dirOf self.outPath);
 
       pyproject = true;
 
