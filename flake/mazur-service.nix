@@ -55,6 +55,9 @@ let
     stuck_detection_window:   5
     failure_streak_threshold: 10
     neglect_threshold_ticks:  5000
+
+    gateway_enabled: true
+    gateway_port: 7878
   '';
 
 in {

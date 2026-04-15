@@ -24,6 +24,9 @@ dev = [
 where = ["."]
 include = ["src*"]
 
+[tool.setuptools.package-data]
+src = ["souls/*.md"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

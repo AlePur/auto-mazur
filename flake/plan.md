@@ -98,7 +98,10 @@ Tailscale finds `/etc/tailscale/authkey` on first boot without any prior SSH.
 ```sh
 source flake/env.sh
 cd flake/
-nix run github:nix-community/nixos-anywhere -- --flake .#aws-agent --extra-files ./secrets --impure claw
+#nix run github:nix-community/nixos-anywhere -- --flake .#aws-agent --extra-files ./secrets --impure claw
+ssh claw -t "mkdir /etc/tailscale"
+scp ./secrets/etc/tailscale/authkey claw:/etc/tailscale/authkey
+nixos-rebuild switch --flake .#aws-agent --impure --target-host claw
 ```
 
 ### Subsequent config changes
@@ -113,11 +116,13 @@ nixos-rebuild switch --flake .#aws-agent --impure --target-host claw
 
 ```sh
 # View live logs
-ssh root@<EC2-IP> journalctl -u mazur -f
+ssh claw journalctl -u mazur -f
 
 # Check service status
-ssh root@<EC2-IP> systemctl status mazur
+ssh claw systemctl status mazur
 
 # Drop into the mazur user's shell (admin only)
-ssh root@<EC2-IP> machinectl shell mazur@
+ssh claw machinectl shell mazur@ 
+
+ssh claw -L 7878:localhost:7878 -N
 ```
