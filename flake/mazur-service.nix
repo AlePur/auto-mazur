@@ -122,6 +122,9 @@ in {
     users.users.mazur = {
       isSystemUser = true;
       group        = "mazur";
+      # Member of mazur-worker group so the daemon can traverse and read
+      # the workspace for gateway /files requests (mode 750, group r-x).
+      extraGroups  = [ "mazur-worker" ];
       home         = "/var/lib/mazur";
       createHome   = false;  # systemd StateDirectory handles this
       shell        = pkgs.shadow;  # nologin — daemon only

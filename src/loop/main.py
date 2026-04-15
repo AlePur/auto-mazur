@@ -61,7 +61,7 @@ class MainLoop:
 
         # Storage
         self._db = Database(config.db_file())
-        self._workspace = Workspace(config.workspace_path())
+        self._workspace = Workspace(config.workspace_path(), worker_user=config.worker_user)
         self._store = Store(config.store_path())
 
         # LLM (inject audit logger so every call is recorded)

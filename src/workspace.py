@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -37,17 +38,23 @@ class Workspace:
     through its shell, read, and write tools.  The workspace contains
     only things the agent is meant to work with — goal work directories
     (src/, data/) and a scratch area.
+
+    When *worker_user* is set (production mode), directories are created
+    via ``sudo -u <worker_user> mkdir -p`` so they are owned by the
+    worker user and the agent's tools can write to them.  In local
+    development (no worker_user) directories are created directly.
     """
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, worker_user: str = "") -> None:
         self.root = Path(root).resolve()
+        self._worker_user = worker_user
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def ensure_structure(self) -> None:
         """Create the directory skeleton if it doesn't already exist."""
         for d in _TOP_DIRS:
-            (self.root / d).mkdir(parents=True, exist_ok=True)
+            self._mkdir(self.root / d)
         log.debug("Workspace ready at %s", self.root)
 
     # ── Goal work directories ──────────────────────────────────────────────
@@ -62,7 +69,7 @@ class Workspace:
         rel = f"goals/{goal_id}-{safe_slug}"
         base = self.root / rel
         for sub in ["", "src", "data"]:
-            (base / sub).mkdir(parents=True, exist_ok=True)
+            self._mkdir(base / sub)
         log.info("Created goal work dir: %s", rel)
         return rel
 
@@ -75,6 +82,25 @@ class Workspace:
     def abs(self, rel_path: str) -> Path:
         """Resolve a workspace-relative path to an absolute Path."""
         return self.root / rel_path
+
+
+    # ── Private helpers ───────────────────────────────────────────────────
+
+    def _mkdir(self, path: Path) -> None:
+        """Create *path* (and any missing parents) with the right ownership.
+
+        In production (*worker_user* set) the directory is created via
+        ``sudo -u <worker_user> mkdir -p`` so it is owned by the worker
+        user.  In local dev the directory is created directly by the
+        current process.
+        """
+        if self._worker_user:
+            subprocess.run(
+                ["sudo", "-u", self._worker_user, "mkdir", "-p", str(path)],
+                check=True,
+            )
+        else:
+            path.mkdir(parents=True, exist_ok=True)
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────
