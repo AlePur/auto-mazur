@@ -180,11 +180,12 @@ class PersistentShell:
     used (local development).
     """
 
-    def __init__(self, worker_user: str = "") -> None:
+    def __init__(self, worker_user: str = "", initial_cwd: str = "") -> None:
         # A unique, unguessable sentinel that cannot plausibly appear in
         # normal command output.
         self._sentinel = f"__MAZUR_{uuid.uuid4().hex}__"
         self._worker_user = worker_user
+        self._initial_cwd = initial_cwd
         self._proc: subprocess.Popen | None = None
         self._start()
 
@@ -206,14 +207,19 @@ class PersistentShell:
             bufsize=1,  # line-buffered
         )
         # Suppress the prompt and command echo so our sentinel parsing is clean.
+        # Then cd to the goal's work directory so the agent starts there.
         init = "PS1=''; PS2=''; set +o history\n"
+        if self._initial_cwd:
+            import shlex
+            init += f"cd {shlex.quote(self._initial_cwd)}\n"
         assert self._proc.stdin is not None
         self._proc.stdin.write(init)
         self._proc.stdin.flush()
         log.debug(
-            "PersistentShell: started pid=%d%s",
+            "PersistentShell: started pid=%d%s%s",
             self._proc.pid,
             f" (as {self._worker_user})" if self._worker_user else "",
+            f" (cwd={self._initial_cwd})" if self._initial_cwd else "",
         )
 
     def close(self) -> None:
@@ -324,9 +330,9 @@ class ToolExecutor:
     state.
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, initial_cwd: str = "") -> None:
         self._cfg = config
-        self._shell = PersistentShell(worker_user=config.worker_user)
+        self._shell = PersistentShell(worker_user=config.worker_user, initial_cwd=initial_cwd)
 
     def close(self) -> None:
         """Shut down the persistent bash shell.  Call once per session."""

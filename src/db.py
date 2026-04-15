@@ -265,14 +265,19 @@ class Database:
         tick_start: int,
         transcript_path: str,
     ) -> int:
-        """Insert a new session row (status=NULL) and return its id."""
+        """Insert a new session row (status='paused' by default) and return its id.
+
+        The status is set to 'paused' so that if the process crashes before
+        complete_session() is called the row truthfully reflects the outcome.
+        complete_session() overwrites it with the real status on normal exit.
+        """
         with self._cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO sessions
                   (goal_id, task_description, task_criteria,
-                   tick_start, transcript_path)
-                VALUES (?, ?, ?, ?, ?)
+                   status, tick_start, transcript_path)
+                VALUES (?, ?, ?, 'paused', ?, ?)
                 """,
                 (
                     goal_id, task.description, task.criteria,

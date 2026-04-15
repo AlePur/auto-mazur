@@ -135,7 +135,7 @@ def build(
         for s in recent_sessions:
             lines.append(
                 f"- session {s['session_id']} [{s['goal_id']}] "
-                f"`{s.get('status', '?')}`: {s.get('summary', '(no summary)')[:120]}"
+                f"`{s.get('status') or 'orphaned'}`: {(s.get('summary') or '(no summary)')[:120]}"
             )
         sections.append("\n".join(lines))
 

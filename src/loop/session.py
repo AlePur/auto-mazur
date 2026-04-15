@@ -87,8 +87,6 @@ class WorkerSession:
         self._attempt = attempt
         self._prev_summary = previous_summary
         self._audit = audit
-        self._executor = ToolExecutor(config)
-        self._guard = TurnGuard(llm=self._llm)
 
         # Conversation state
         self._messages: list[dict[str, Any]] = []
@@ -103,6 +101,9 @@ class WorkerSession:
 
     def run(self) -> SessionResult:
         """Run the session loop to completion."""
+        initial_cwd = str(self._workspace.goal_work_dir(self._goal.workspace_path))
+        self._executor = ToolExecutor(self._config, initial_cwd=initial_cwd)
+        self._guard = TurnGuard(llm=self._llm)
         self._init_messages()
         tick_id = self._db.get_last_tick_id() + 1
 
