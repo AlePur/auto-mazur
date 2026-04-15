@@ -68,6 +68,8 @@ class WorkerSession:
         goal: Goal,
         task: Task,
         session_id: int,
+        tick_start: int,
+        transcript_path: str,
         attempt: int = 0,
         previous_summary: str | None = None,
         audit: "AuditLogger | None" = None,
@@ -80,6 +82,8 @@ class WorkerSession:
         self._goal = goal
         self._task = task
         self._session_id = session_id
+        self._tick_start = tick_start
+        self._transcript_path = transcript_path
         self._attempt = attempt
         self._prev_summary = previous_summary
         self._audit = audit
@@ -333,9 +337,11 @@ class WorkerSession:
             task=self._task,
             status=status,
             summary=summary,
+            tick_start=self._tick_start,
             tick_end=tick_id,
             action_count=self._action_count,
             tokens_used=self._tokens_used,
+            transcript_path=self._transcript_path,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────

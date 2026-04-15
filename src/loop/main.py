@@ -267,11 +267,32 @@ class MainLoop:
                 goal=goal,
                 task=task,
                 session_id=session_id,
+                tick_start=tick_start_session,
+                transcript_path=str(transcript_path),
                 attempt=attempt,
                 previous_summary=previous_summary,
                 audit=self._audit,
             )
-            result = session.run()
+            try:
+                result = session.run()
+            except Exception as exc:
+                log.exception(
+                    "WorkerSession raised unexpectedly for %s (attempt %d): %s",
+                    task.goal_id, attempt + 1, exc,
+                )
+                from ..models import SESSION_STATUS_API_ERROR
+                result = SessionResult(
+                    session_id=session_id,
+                    goal_id=task.goal_id,
+                    task=task,
+                    status=SESSION_STATUS_API_ERROR,
+                    summary=f"Session crashed unexpectedly: {exc}",
+                    tick_start=tick_start_session,
+                    tick_end=self._db.get_last_tick_id(),
+                    action_count=0,
+                    tokens_used=0,
+                    transcript_path=str(transcript_path),
+                )
 
             # WorkerSession updates tick via db.get_last_tick_id internally;
             # sync our counter to whatever the session advanced it to.
