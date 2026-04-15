@@ -152,6 +152,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ── GET router ─────────────────────────────────────────────────────────
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        """Handle CORS preflight requests (sent before POST /inbox)."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _route_get(self, path: str, qs: dict) -> Any:  # noqa: C901
         db = self.db
         ws = self.workspace
@@ -381,9 +391,9 @@ class _Handler(BaseHTTPRequestHandler):
             n = _int_qs(qs, "n", 20)
             return db.get_recent_inbox(n=n)
 
-        # /files/{rel_path} — serve any workspace file
-        if path.startswith("/files/"):
-            rel = path[len("/files/"):]
+        # /files  or  /files/{rel_path} — serve any workspace file
+        if path == "/files" or path.startswith("/files/"):
+            rel = path[len("/files/"):] if path.startswith("/files/") else ""
             # Response shape depends on whether the path is a directory or file;
             # see _serve_file() for the exact shapes.
             return self._serve_file(rel)

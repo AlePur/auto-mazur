@@ -110,6 +110,34 @@ in {
       shell        = pkgs.bash;
       description  = "Mazur autonomous LLM agent";
       # No extraGroups → no sudo, no wheel, no special privileges
+
+      # Packages available in mazur's PATH.  The agent works almost entirely
+      # through the shell() tool so a rich set of CLI tools matters a lot.
+      packages = with pkgs; [
+        # Core utilities (not always present on minimal NixOS systems)
+        coreutils findutils diffutils gnugrep gnused gawk which
+
+        # Fast search & directory navigation
+        ripgrep fd tree file
+
+        # Structured data wrangling
+        jq yq-go
+
+        # Network / HTTP
+        curl wget
+
+        # Version control
+        git
+
+        # Archive & compression
+        unzip zip gnutar gzip bzip2 xz
+
+        # Process / system inspection
+        procps lsof
+
+        # General scripting helpers
+        python3 bc patch
+      ];
     };
     users.groups.mazur = {};
 
