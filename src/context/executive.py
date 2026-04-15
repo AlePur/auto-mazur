@@ -105,7 +105,7 @@ def build(
         hidden_active = len(active) - len(shown_active)
         lines = [f"## Active Goals ({len(active)})"]
         for g in shown_active:
-            lines.append(_format_active_goal(g, workspace))
+            lines.append(_format_active_goal(g, store))
         if hidden_active:
             lines.append(
                 f"\n_...{hidden_active} more active goal(s) not shown. "
