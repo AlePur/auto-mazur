@@ -307,7 +307,7 @@ class Database:
             if goal_id:
                 rows = cur.execute(
                     """
-                    SELECT session_id, goal_id, status, summary,
+                    SELECT session_id, goal_id, task_description, status, summary,
                            tick_start, tick_end, action_count
                     FROM sessions
                     WHERE goal_id = ?
@@ -318,7 +318,7 @@ class Database:
             else:
                 rows = cur.execute(
                     """
-                    SELECT session_id, goal_id, status, summary,
+                    SELECT session_id, goal_id, task_description, status, summary,
                            tick_start, tick_end, action_count
                     FROM sessions
                     ORDER BY session_id DESC LIMIT ?
@@ -351,16 +351,32 @@ class Database:
         return row["last_id"] or 0
 
     def get_recent_ticks(
-        self, n: int, goal_id: str | None = None
+        self, n: int, goal_id: str | None = None, actor: str | None = None
     ) -> list[TickRecord]:
         with self._cursor() as cur:
-            if goal_id:
+            if goal_id and actor:
+                rows = cur.execute(
+                    """
+                    SELECT * FROM ticks WHERE goal_id = ? AND actor = ?
+                    ORDER BY tick_id DESC LIMIT ?
+                    """,
+                    (goal_id, actor, n),
+                ).fetchall()
+            elif goal_id:
                 rows = cur.execute(
                     """
                     SELECT * FROM ticks WHERE goal_id = ?
                     ORDER BY tick_id DESC LIMIT ?
                     """,
                     (goal_id, n),
+                ).fetchall()
+            elif actor:
+                rows = cur.execute(
+                    """
+                    SELECT * FROM ticks WHERE actor = ?
+                    ORDER BY tick_id DESC LIMIT ?
+                    """,
+                    (actor, n),
                 ).fetchall()
             else:
                 rows = cur.execute(

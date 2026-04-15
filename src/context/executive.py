@@ -25,10 +25,12 @@ from ..store import Store
 # ── Caps ───────────────────────────────────────────────────────────────────
 _MAX_ACTIVE_GOALS       = 20    # active goals shown in full
 _MAX_NONTERMINAL_GOALS  = 20    # paused/blocked goals shown as one-liners
-_MAX_RECENT_TICKS       = 10    # recent executive decisions
+_MAX_RECENT_TICKS       = 10    # recent executive decisions (guaranteed, actor-filtered)
 _MAX_CHECKPOINT_CHARS   = 1_500 # truncation for checkpoint in briefing
 _MAX_PRIORITIES_CHARS   = 2_000 # truncation for PRIORITIES.md in briefing
 _MAX_REFLECTIONS        = 3     # recent reflections shown as one-liners
+_MAX_OUTBOX_ITEMS       = 3     # recent outbox messages shown
+_MAX_OUTBOX_CHARS       = 2_000 # truncation per outbox message content
 
 
 def build(
@@ -67,16 +69,20 @@ def build(
             lines.append(f"- [{msg['id']}] {msg['text']}")
         sections.append("\n".join(lines))
 
-    # ── Last session result (status only — no duplicate detail) ────────────
-    if last_result:
-        goal = db.get_goal(last_result.goal_id)
-        goal_title = goal.title if goal else last_result.goal_id
+    # ── Last session result — always fetched from DB so it persists across
+    #    ticks (not just the tick immediately following the session).
+    recent_sessions = db.get_recent_sessions(n=1)
+    if recent_sessions:
+        s = recent_sessions[0]
+        goal = db.get_goal(s["goal_id"])
+        goal_title = goal.title if goal else s["goal_id"]
         result_block = (
             f"## Last Worker Session\n"
-            f"- **Goal:** {goal_title} ({last_result.goal_id})\n"
-            f"- **Task:** {last_result.task.description}\n"
-            f"- **Outcome:** `{last_result.status}`\n"
-            f"- **Summary:** {last_result.summary}\n"
+            f"- **Goal:** {goal_title} ({s['goal_id']})\n"
+            f"- **Task:** {s.get('task_description', '(unknown)')}\n"
+            f"- **Outcome:** `{s.get('status') or 'in-progress'}`\n"
+            f"- **Summary:** {s.get('summary') or '(no summary yet)'}\n"
+            f"- **Ticks:** {s.get('tick_start')}–{s.get('tick_end', '?')}\n"
             f"_(Use list_sessions or read_checkpoint for full detail.)_"
         )
         sections.append(result_block)
@@ -133,15 +139,27 @@ def build(
             f"## Completed / Abandoned Goals\n{terminal_count} total (see DB or archive)"
         )
 
-    # ── Recent Executive decisions ─────────────────────────────────────────
-    recent = db.get_recent_ticks(n=_MAX_RECENT_TICKS)
-    exec_ticks = [t for t in recent if t.actor == "executive"]
+    # ── Recent Executive decisions — actor-filtered at DB level so we always
+    #    get up to _MAX_RECENT_TICKS genuine executive decisions, not mixed.
+    exec_ticks = db.get_recent_ticks(n=_MAX_RECENT_TICKS, actor="executive")
     if exec_ticks:
         lines = ["## Recent Executive Decisions"]
-        for t in exec_ticks[-_MAX_RECENT_TICKS:]:
+        for t in exec_ticks:
             icon = "✓" if t.outcome == "ok" else "✗"
             lines.append(f"- {icon} tick {t.tick_id}: {t.summary}")
         sections.append("\n".join(lines))
+
+    # ── Recent outbox messages (what the Executive last said to the user) ──
+    outbox_entries = db.get_recent_outbox(_MAX_OUTBOX_ITEMS)
+    if outbox_entries:
+        lines = [f"## Recent Outbox Messages (last {len(outbox_entries)})"]
+        for entry in outbox_entries:
+            title = entry.get("title") or "(no title)"
+            content = entry.get("content") or ""
+            if len(content) > _MAX_OUTBOX_CHARS:
+                content = content[:_MAX_OUTBOX_CHARS] + "\n...[truncated]"
+            lines.append(f"### {title}\n{content}")
+        sections.append("\n\n".join(lines))
 
     # ── PRIORITIES.md (strategic rationale) ───────────────────────────────
     priorities = store.read_priorities()
