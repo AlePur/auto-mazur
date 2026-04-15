@@ -35,6 +35,7 @@ from ..consolidation import Consolidation
 from ..db import Database
 from ..health import HealthChecker
 from ..llm import LLMClient
+from ..store import Store
 from .actions import ActionExecutor, ActionResult
 from .executive import ExecutiveTick
 from .session import WorkerSession
@@ -61,6 +62,7 @@ class MainLoop:
         # Storage
         self._db = Database(config.db_file())
         self._workspace = Workspace(config.workspace_path())
+        self._store = Store(config.store_path())
 
         # LLM (inject audit logger so every call is recorded)
         self._llm = LLMClient(config, audit=audit)
@@ -70,18 +72,19 @@ class MainLoop:
         self._consolidation = Consolidation(
             config=config,
             db=self._db,
-            workspace=self._workspace,
+            store=self._store,
             llm=self._llm,
         )
         self._executive_tick = ExecutiveTick(
             config=config,
             llm=self._llm,
             db=self._db,
-            workspace=self._workspace,
+            store=self._store,
         )
         self._action_executor = ActionExecutor(
             db=self._db,
             workspace=self._workspace,
+            store=self._store,
         )
 
         # Gateway HTTP server thread (started lazily in start())
@@ -107,6 +110,7 @@ class MainLoop:
         self._db.connect()
         self._db.ensure_schema()
         self._workspace.ensure_structure()
+        self._store.ensure_structure()
 
         # Resume: start one tick past the last recorded tick
         self._tick = self._db.get_last_tick_id() + 1
@@ -243,7 +247,7 @@ class MainLoop:
             )
 
             # Open session in DB and get session_id
-            transcript_path = self._workspace.transcript_path(
+            transcript_path = self._store.transcript_path(
                 goal.workspace_path, session_id=self._tick
             )
             session_id = self._db.open_session(
@@ -259,6 +263,7 @@ class MainLoop:
                 llm=self._llm,
                 db=self._db,
                 workspace=self._workspace,
+                store=self._store,
                 goal=goal,
                 task=task,
                 session_id=session_id,
@@ -385,6 +390,7 @@ class MainLoop:
             host=host,
             port=port,
             db=self._db,
+            store=self._store,
             workspace=self._workspace,
             audit=self._audit,
             loop=self,

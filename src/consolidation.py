@@ -46,7 +46,7 @@ from .models import (
     OUTCOME_OK,
     TickRecord,
 )
-from .workspace import Workspace
+from .store import Store
 
 log = logging.getLogger(__name__)
 
@@ -57,12 +57,12 @@ class Consolidation:
         *,
         config: Config,
         db: Database,
-        workspace: Workspace,
+        store: Store,
         llm: LLMClient,
     ) -> None:
         self._config = config
         self._db = db
-        self._workspace = workspace
+        self._store = store
         self._llm = llm
         self._reflection_requested = False
         self._reflection_reason = ""
@@ -118,7 +118,7 @@ class Consolidation:
             if not session.get("summary"):
                 continue
 
-            prev = self._workspace.read_checkpoint(goal.workspace_path)
+            prev = self._store.read_checkpoint(goal.workspace_path)
             messages = sum_char.checkpoint_prompt(
                 task_description=session.get("task_description", ""),
                 session_summary=session["summary"],
@@ -128,7 +128,7 @@ class Consolidation:
                 response = self._llm.chat(messages, temperature=0.2)
                 checkpoint_text = response.content or ""
                 if checkpoint_text:
-                    self._workspace.write_checkpoint(goal.workspace_path, checkpoint_text)
+                    self._store.write_checkpoint(goal.workspace_path, checkpoint_text)
                     log.debug("Updated checkpoint for %s", goal.goal_id)
             except Exception as exc:
                 log.error("Checkpoint update failed for %s: %s", goal.goal_id, exc)
@@ -157,7 +157,7 @@ class Consolidation:
                 if not journal_text:
                     continue
 
-                journal_path = self._workspace.append_journal(
+                journal_path = self._store.append_journal(
                     goal.workspace_path, tick_start, tick_end, journal_text
                 )
 
@@ -172,7 +172,7 @@ class Consolidation:
                 )[:120]
 
                 # Relative path for DB index
-                rel_path = str(journal_path.relative_to(self._workspace.root))
+                rel_path = str(journal_path.relative_to(self._store.root))
                 self._db.upsert_journal(
                     goal_id=goal.goal_id,
                     tick_start=tick_start,
@@ -203,7 +203,7 @@ class Consolidation:
         for goal in active_goals:
             db_entries = self._db.get_recent_journals(goal.goal_id, n=5)
             for e in db_entries:
-                content = self._workspace.read_journal_file(e["file_path"])
+                content = self._store.read_journal_file(e["file_path"])
                 if content:
                     all_entries.append(f"### {goal.title} ({goal.goal_id})\n{content}")
 
@@ -218,7 +218,7 @@ class Consolidation:
             if not weekly_text:
                 return
 
-            weekly_path = self._workspace.write_weekly_summary(current_tick, weekly_text)
+            weekly_path = self._store.write_weekly_summary(current_tick, weekly_text)
 
             summary_line = next(
                 (
@@ -229,7 +229,7 @@ class Consolidation:
                 "",
             )[:120]
 
-            rel_path = str(weekly_path.relative_to(self._workspace.root))
+            rel_path = str(weekly_path.relative_to(self._store.root))
             self._db.upsert_weekly(
                 tick=current_tick,
                 file_path=rel_path,
@@ -259,7 +259,7 @@ class Consolidation:
             {"role": "system", "content": reflector_char.SYSTEM_PROMPT},
             *reflector_context.build(
                 db=self._db,
-                workspace=self._workspace,
+                store=self._store,
                 current_tick=current_tick,
                 trigger_reason=reason,
             ),
@@ -297,7 +297,7 @@ class Consolidation:
         # Apply knowledge updates
         for ku in result.knowledge_updates:
             try:
-                path = self._workspace.write_knowledge(ku.topic, ku.content)
+                path = self._store.write_knowledge(ku.topic, ku.content)
                 summary_line = next(
                     (
                         line.strip()
@@ -308,7 +308,7 @@ class Consolidation:
                 )[:120]
                 self._db.upsert_knowledge(
                     topic=ku.topic,
-                    file_path=str(path.relative_to(self._workspace.root)),
+                    file_path=str(path.relative_to(self._store.root)),
                     summary=summary_line,
                     tick=current_tick,
                 )
@@ -319,7 +319,7 @@ class Consolidation:
         # Write updated PRIORITIES.md
         if result.priorities_md:
             try:
-                self._workspace.write_priorities(result.priorities_md)
+                self._store.write_priorities(result.priorities_md)
                 log.info("Reflector: updated PRIORITIES.md")
             except Exception as exc:
                 log.error("Failed to write PRIORITIES.md: %s", exc)
@@ -329,7 +329,7 @@ class Consolidation:
         header = f"## Reflection at tick {current_tick} ({reason})\n\n"
         full_content = header + observations
         try:
-            reflection_path = self._workspace.write_reflection(current_tick, full_content)
+            reflection_path = self._store.write_reflection(current_tick, full_content)
             summary_line = next(
                 (
                     line.strip()
@@ -338,7 +338,7 @@ class Consolidation:
                 ),
                 "",
             )[:120]
-            rel_path = str(reflection_path.relative_to(self._workspace.root))
+            rel_path = str(reflection_path.relative_to(self._store.root))
             self._db.upsert_reflection(
                 tick=current_tick,
                 trigger_reason=reason,
@@ -376,7 +376,7 @@ class Consolidation:
             return
 
         archive_path = str(
-            self._workspace.abs(f"archive/ticks-before-{archive_before}.jsonl")
+            self._store.abs(f"archive/ticks-before-{archive_before}.jsonl")
         )
         try:
             count = self._db.archive_ticks_before(archive_before, archive_path)
@@ -396,11 +396,11 @@ class Consolidation:
         # Compress old session transcripts
         all_goals = self._db.get_all_goals()
         for goal in all_goals:
-            sessions_dir = self._workspace.abs(goal.workspace_path) / "sessions"
+            sessions_dir = self._store.abs(goal.workspace_path) / "sessions"
             if not sessions_dir.exists():
                 continue
             for jsonl_file in sessions_dir.glob("*.jsonl"):
                 try:
-                    self._workspace.compress_transcript(jsonl_file)
+                    self._store.compress_transcript(jsonl_file)
                 except Exception as exc:
                     log.error("Transcript compression failed for %s: %s", jsonl_file, exc)

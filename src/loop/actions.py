@@ -31,6 +31,7 @@ from ..models import (
     Task,
     TickRecord,
 )
+from ..store import Store
 from ..workspace import Workspace
 
 log = logging.getLogger(__name__)
@@ -47,9 +48,10 @@ class ActionResult:
 
 
 class ActionExecutor:
-    def __init__(self, *, db: Database, workspace: Workspace) -> None:
+    def __init__(self, *, db: Database, workspace: Workspace, store: Store) -> None:
         self._db = db
         self._workspace = workspace
+        self._store = store
         self._goal_counter = 0          # incremented when new goals are created
 
     def execute(self, action: ExecutiveAction) -> ActionResult:
@@ -117,8 +119,9 @@ class ActionExecutor:
         goal_num = max(max_num + 1, self._goal_counter)
         goal_id = f"goal-{goal_num:03d}"
 
-        # Create workspace directory
+        # Create workspace directory + store state directory
         workspace_path = self._workspace.create_goal_dir(goal_id, title)
+        self._store.create_goal_state_dir(workspace_path)
 
         # Get current tick (0 if DB is empty — fixed up by main loop)
         current_tick = self._db.get_last_tick_id()

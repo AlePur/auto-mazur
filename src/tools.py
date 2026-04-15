@@ -4,8 +4,16 @@ Tool implementations — the Worker's interface to the real world.
 Four tools:
   shell(command)              → run any shell command via bash
   read(path, lines="0-100")  → read a file, optionally a line range
-  write(path, content)       → write a file
-  finish(summary, status)    → end the session
+  write(path, content)        → write a file
+  finish(summary, status)     → end the session
+
+All three I/O tools (shell, read, write) run as the ``worker_user`` when
+configured.  This means they share the same filesystem permissions — only
+paths accessible to the worker user are reachable.  The daemon's internal
+state (Store) is owned by a different user and is invisible to these tools.
+
+When ``worker_user`` is empty (local development), all tools run as the
+current process user — no sudo involved.
 
 The read tool always applies two caps (whichever is more restrictive):
   - lines range (default first 100 lines, configurable via config.max_read_lines)
@@ -164,13 +172,19 @@ class PersistentShell:
     exactly the behaviour an LLM agent expects.
 
     The --login flag sources /etc/profile and the per-user profile, giving
-    the mazur user access to all packages listed in users.users.mazur.packages.
+    the worker user access to all packages listed in its user-level packages.
+
+    When ``worker_user`` is set, the shell is spawned via
+    ``sudo -u <worker_user> bash --login`` so that all commands run with
+    the worker user's permissions.  When empty, plain ``bash --login`` is
+    used (local development).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, worker_user: str = "") -> None:
         # A unique, unguessable sentinel that cannot plausibly appear in
         # normal command output.
         self._sentinel = f"__MAZUR_{uuid.uuid4().hex}__"
+        self._worker_user = worker_user
         self._proc: subprocess.Popen | None = None
         self._start()
 
@@ -178,8 +192,13 @@ class PersistentShell:
 
     def _start(self) -> None:
         """Spawn (or re-spawn) the persistent bash login shell."""
+        if self._worker_user:
+            cmd = ["sudo", "-u", self._worker_user, "bash", "--login"]
+        else:
+            cmd = ["bash", "--login"]
+
         self._proc = subprocess.Popen(
-            ["bash", "--login"],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -191,7 +210,11 @@ class PersistentShell:
         assert self._proc.stdin is not None
         self._proc.stdin.write(init)
         self._proc.stdin.flush()
-        log.debug("PersistentShell: started pid=%d", self._proc.pid)
+        log.debug(
+            "PersistentShell: started pid=%d%s",
+            self._proc.pid,
+            f" (as {self._worker_user})" if self._worker_user else "",
+        )
 
     def close(self) -> None:
         """Gracefully shut down the shell process."""
@@ -294,11 +317,16 @@ class ToolExecutor:
     A single PersistentShell is kept alive for the whole session so that
     shell state (cwd, env-vars, venvs, etc.) carries across tool calls.
     Call close() when the session ends to tear it down.
+
+    When ``config.worker_user`` is set, all three I/O tools (shell, read,
+    write) run as that user — providing uniform filesystem permissions
+    that match the agent's workspace and exclude the daemon's internal
+    state.
     """
 
     def __init__(self, config: Config) -> None:
         self._cfg = config
-        self._shell = PersistentShell()
+        self._shell = PersistentShell(worker_user=config.worker_user)
 
     def close(self) -> None:
         """Shut down the persistent bash shell.  Call once per session."""
@@ -333,6 +361,27 @@ class ToolExecutor:
                     is_error=True,
                     truncated=False,
                 )
+
+    # ── Helper: run a command as the worker user ───────────────────────────
+
+    def _run_as_worker(
+        self,
+        args: list[str],
+        input: bytes | None = None,
+        timeout: int = 30,
+    ) -> subprocess.CompletedProcess:
+        """
+        Run a command, optionally as the configured worker user via sudo.
+        When worker_user is empty, runs directly as the current user.
+        """
+        if self._cfg.worker_user:
+            args = ["sudo", "-n", "-u", self._cfg.worker_user, "--"] + args
+        return subprocess.run(
+            args,
+            input=input,
+            capture_output=True,
+            timeout=timeout,
+        )
 
     # ── Individual tools ───────────────────────────────────────────────────
 
@@ -387,24 +436,41 @@ class ToolExecutor:
 
         Output is always capped at config.max_read_chars characters.
         A metadata header is prepended so the Worker knows the full file size.
+
+        Runs as the worker user when configured, so only files accessible
+        to that user can be read.
         """
         if not path.strip():
             return ToolResult(output="[empty path]", is_error=True, truncated=False)
 
-        p = Path(path)
-        log.debug("read: %s lines=%s", p, lines)
+        log.debug("read: %s lines=%s", path, lines)
 
         try:
-            raw_bytes = p.read_bytes()
-        except FileNotFoundError:
+            proc = self._run_as_worker(["cat", "--", path], timeout=30)
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode(errors="replace").strip()
+                if "No such file" in stderr:
+                    return ToolResult(
+                        output=f"[FILE NOT FOUND: {path}]",
+                        is_error=True,
+                        truncated=False,
+                    )
+                elif "Permission denied" in stderr:
+                    return ToolResult(
+                        output=f"[PERMISSION DENIED: {path}]",
+                        is_error=True,
+                        truncated=False,
+                    )
+                else:
+                    return ToolResult(
+                        output=f"[ERROR reading {path}: {stderr}]",
+                        is_error=True,
+                        truncated=False,
+                    )
+            raw_bytes = proc.stdout
+        except subprocess.TimeoutExpired:
             return ToolResult(
-                output=f"[FILE NOT FOUND: {path}]",
-                is_error=True,
-                truncated=False,
-            )
-        except PermissionError:
-            return ToolResult(
-                output=f"[PERMISSION DENIED: {path}]",
+                output=f"[TIMEOUT reading {path}]",
                 is_error=True,
                 truncated=False,
             )
@@ -457,17 +523,44 @@ class ToolExecutor:
         )
 
     def write(self, path: str, content: str) -> ToolResult:
+        """
+        Write content to a file.
+
+        Runs as the worker user when configured, so only paths writable
+        by that user can be written to.
+        """
         if not path.strip():
             return ToolResult(output="[empty path]", is_error=True, truncated=False)
 
-        p = Path(path)
-        log.debug("write: %s (%d chars)", p, len(content))
+        log.debug("write: %s (%d chars)", path, len(content))
+
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
-        except PermissionError:
+            # Create parent directories
+            parent = str(Path(path).parent)
+            self._run_as_worker(["mkdir", "-p", "--", parent], timeout=10)
+
+            # Write content via tee (stdin → file)
+            proc = self._run_as_worker(
+                ["tee", "--", path],
+                input=content.encode("utf-8"),
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode(errors="replace").strip()
+                if "Permission denied" in stderr:
+                    return ToolResult(
+                        output=f"[PERMISSION DENIED: {path}]",
+                        is_error=True,
+                        truncated=False,
+                    )
+                return ToolResult(
+                    output=f"[ERROR writing {path}: {stderr}]",
+                    is_error=True,
+                    truncated=False,
+                )
+        except subprocess.TimeoutExpired:
             return ToolResult(
-                output=f"[PERMISSION DENIED: {path}]",
+                output=f"[TIMEOUT writing {path}]",
                 is_error=True,
                 truncated=False,
             )

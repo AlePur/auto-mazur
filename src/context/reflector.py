@@ -12,7 +12,7 @@ regardless of how long the agent has been running.
 from __future__ import annotations
 
 from ..db import Database
-from ..workspace import Workspace
+from ..store import Store
 
 # ── Caps ───────────────────────────────────────────────────────────────────
 _MAX_GOALS              = 50    # total goals listed (all statuses)
@@ -30,7 +30,7 @@ _MAX_REFLECTION_CHARS   = 1_500 # chars per previous reflection
 
 def build(
     db: Database,
-    workspace: Workspace,
+    store: Store,
     current_tick: int,
     trigger_reason: str,
 ) -> list[dict]:
@@ -75,7 +75,7 @@ def build(
         sections.append("\n".join(lines))
 
     # ── Current PRIORITIES.md (capped) ────────────────────────────────────
-    priorities = workspace.read_priorities()
+    priorities = store.read_priorities()
     if priorities:
         if len(priorities) > _MAX_PRIORITIES_CHARS:
             priorities = priorities[:_MAX_PRIORITIES_CHARS] + "\n...[truncated]"
@@ -103,7 +103,7 @@ def build(
             continue
         goal_parts = []
         for e in entries:
-            content = workspace.read_journal_file(e["file_path"]) or ""
+            content = store.read_journal_file(e["file_path"]) or ""
             if len(content) > _MAX_JOURNAL_CHARS:
                 content = content[:_MAX_JOURNAL_CHARS] + "\n...[truncated]"
             goal_parts.append(f"_Ticks {e['tick_start']}–{e['tick_end']}_\n{content}")
@@ -120,7 +120,7 @@ def build(
     if weekly_entries:
         weekly_parts = []
         for w in weekly_entries:
-            content = workspace.read_weekly_file(w["file_path"]) or ""
+            content = store.read_weekly_file(w["file_path"]) or ""
             if len(content) > _MAX_WEEKLY_CHARS:
                 content = content[:_MAX_WEEKLY_CHARS] + "\n...[truncated]"
             weekly_parts.append(f"_Tick {w['tick']}_\n{content}")
@@ -144,7 +144,7 @@ def build(
     if prev_reflections:
         lines = [f"## Previous Reflections (last {len(prev_reflections)})"]
         for r in prev_reflections:
-            content = workspace.read_reflection_file(r["file_path"]) or ""
+            content = store.read_reflection_file(r["file_path"]) or ""
             if len(content) > _MAX_REFLECTION_CHARS:
                 content = content[:_MAX_REFLECTION_CHARS] + "\n...[truncated]"
             lines.append(

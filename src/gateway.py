@@ -55,6 +55,7 @@ from urllib.parse import parse_qs, urlparse
 if TYPE_CHECKING:
     from .audit import AuditLogger
     from .db import Database
+    from .store import Store
     from .workspace import Workspace
 
 log = logging.getLogger(__name__)
@@ -75,9 +76,10 @@ class GatewayServer:
         host: str,
         port: int,
         db: "Database",
-        workspace: "Workspace",
+        store: "Store",
         audit: "AuditLogger | None",
         loop: Any,  # MainLoop — imported lazily to avoid circular dependency
+        workspace: "Workspace | None" = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -86,6 +88,7 @@ class GatewayServer:
         # RequestHandler is instantiated fresh per request, we use class-level
         # attributes rather than instance attributes.
         _Handler.db = db
+        _Handler.store = store
         _Handler.workspace = workspace
         _Handler.audit = audit
         _Handler.loop = loop
@@ -105,7 +108,8 @@ class GatewayServer:
 class _Handler(BaseHTTPRequestHandler):
     # Populated by GatewayServer.__init__ — shared across all request instances
     db: "Database"
-    workspace: "Workspace"
+    store: "Store"
+    workspace: "Workspace | None" = None  # only for /files endpoint
     audit: "AuditLogger | None" = None
     loop: Any = None
 
@@ -164,7 +168,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _route_get(self, path: str, qs: dict) -> Any:  # noqa: C901
         db = self.db
-        ws = self.workspace
+        store = self.store
 
         # /status
         if path == "/status":
@@ -249,7 +253,7 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 if not entry:
                     raise _NotFound(f"journal tick_start={tick_start} not found")
-                content = ws.read_journal_file(entry["file_path"])
+                content = store.read_journal_file(entry["file_path"])
                 return {"file_path": entry["file_path"], "content": content or ""}
 
             if sub == "checkpoint":
@@ -262,7 +266,7 @@ class _Handler(BaseHTTPRequestHandler):
                 goal = db.get_goal(goal_id)
                 if not goal:
                     raise _NotFound(f"goal {goal_id!r} not found")
-                cp = ws.read_checkpoint(goal.workspace_path)
+                cp = store.read_checkpoint(goal.workspace_path)
                 return {"content": cp or ""}
 
             raise _NotFound(f"unknown sub-resource {sub!r}")
@@ -298,7 +302,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/knowledge/"):
             topic = path[len("/knowledge/"):]
-            content = ws.read_knowledge(topic)
+            content = store.read_knowledge(topic)
             if content is None:
                 raise _NotFound(f"knowledge topic {topic!r} not found")
             # Response:
@@ -327,7 +331,7 @@ class _Handler(BaseHTTPRequestHandler):
             entry = next((e for e in entries if str(e["tick"]) == tick_str), None)
             if not entry:
                 raise _NotFound(f"reflection tick={tick_str} not found")
-            content = ws.read_reflection_file(entry["file_path"])
+            content = store.read_reflection_file(entry["file_path"])
             # Response:
             #   {
             #     "tick":    int,
@@ -354,7 +358,7 @@ class _Handler(BaseHTTPRequestHandler):
             entry = next((e for e in entries if str(e["tick"]) == tick_str), None)
             if not entry:
                 raise _NotFound(f"weekly tick={tick_str} not found")
-            content = ws.read_weekly_file(entry["file_path"])
+            content = store.read_weekly_file(entry["file_path"])
             # Response:
             #   {
             #     "tick":    int,
@@ -551,6 +555,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "content":   str         -- UTF-8 text; replacement char (U+FFFD) on decode errors
             }
         """
+        if not self.workspace:
+            raise _NotFound("/files endpoint requires workspace to be configured")
         root = self.workspace.root
         # Resolve and verify the path stays inside workspace root
         try:

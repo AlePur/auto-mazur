@@ -37,7 +37,7 @@ from ..models import (
     SessionResult,
     TickRecord,
 )
-from ..workspace import Workspace
+from ..store import Store
 from .turn_guard import TurnGuard, TurnPolicy
 
 log = logging.getLogger(__name__)
@@ -53,12 +53,12 @@ class ExecutiveTick:
         config: Config,
         llm: LLMClient,
         db: Database,
-        workspace: Workspace,
+        store: Store,
     ) -> None:
         self._config = config
         self._llm = llm
         self._db = db
-        self._workspace = workspace
+        self._store = workspace
         self._guard = TurnGuard(
             llm=self._llm,
             policy=TurnPolicy(max_no_tool_retries=1),
@@ -80,7 +80,7 @@ class ExecutiveTick:
             {"role": "system", "content": exec_char.SYSTEM_PROMPT},
             *exec_context.build(
                 db=self._db,
-                workspace=self._workspace,
+                store=self._store,
                 current_tick=current_tick,
                 last_result=last_result,
                 health_issues=health_issues,
@@ -202,7 +202,7 @@ class ExecutiveTick:
                 goal = self._db.get_goal(goal_id)
                 if not goal:
                     return f"[Goal {goal_id!r} not found]"
-                cp = self._workspace.read_checkpoint(goal.workspace_path)
+                cp = self._store.read_checkpoint(goal.workspace_path)
                 return cp or "(no checkpoint yet)"
 
             case "read_journal":
@@ -216,7 +216,7 @@ class ExecutiveTick:
                     return "(no journal entries yet)"
                 parts = []
                 for e in entries:
-                    content = self._workspace.read_journal_file(e["file_path"]) or "(unreadable)"
+                    content = self._store.read_journal_file(e["file_path"]) or "(unreadable)"
                     parts.append(
                         f"### Ticks {e['tick_start']}\u2013{e['tick_end']}\n{content}"
                     )
@@ -224,7 +224,7 @@ class ExecutiveTick:
 
             case "read_knowledge":
                 topic = str(args.get("topic", ""))
-                content = self._workspace.read_knowledge(topic)
+                content = self._store.read_knowledge(topic)
                 return content or f"(no knowledge file for topic {topic!r})"
 
             case "search_knowledge":
@@ -260,7 +260,7 @@ class ExecutiveTick:
                     return "(no reflections yet)"
                 parts = []
                 for e in entries:
-                    content = self._workspace.read_reflection_file(e["file_path"]) or "(unreadable)"
+                    content = self._store.read_reflection_file(e["file_path"]) or "(unreadable)"
                     parts.append(
                         f"### Reflection at tick {e['tick']} ({e['trigger_reason']})\n{content}"
                     )

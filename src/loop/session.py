@@ -40,6 +40,7 @@ from ..models import (
     Task,
     TickRecord,
 )
+from ..store import Store
 from ..tools import ToolExecutor, WORKER_TOOL_SCHEMAS, format_tool_result_for_llm, format_tool_call_for_transcript
 from ..workspace import Workspace
 from .turn_guard import TurnGuard
@@ -63,6 +64,7 @@ class WorkerSession:
         llm: LLMClient,
         db: Database,
         workspace: Workspace,
+        store: Store,
         goal: Goal,
         task: Task,
         session_id: int,
@@ -74,6 +76,7 @@ class WorkerSession:
         self._llm = llm
         self._db = db
         self._workspace = workspace
+        self._store = store
         self._goal = goal
         self._task = task
         self._session_id = session_id
@@ -230,6 +233,7 @@ class WorkerSession:
                 goal=self._goal,
                 task=self._task,
                 workspace=self._workspace,
+                store=self._store,
                 db=self._db,
                 attempt=self._attempt,
                 previous_summary=self._prev_summary,
@@ -310,8 +314,8 @@ class WorkerSession:
         except Exception as exc:
             log.warning("Failed to close ToolExecutor shell: %s", exc)
 
-        # Write out transcript
-        transcript_path = self._workspace.transcript_path(
+        # Write out transcript (to store, not workspace — agent can't tamper)
+        transcript_path = self._store.transcript_path(
             self._goal.workspace_path, self._session_id
         )
         if self._transcript_entries:

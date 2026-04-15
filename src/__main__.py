@@ -83,8 +83,8 @@ def main() -> None:
 
     # Audit logger — always created so LLM outputs and tool calls are recorded
     from .audit import AuditLogger
-    audit = AuditLogger(workspace_root=config.workspace_root)
-    log.info("Audit logs: %s/audit/", config.workspace_root)
+    audit = AuditLogger(store_root=config.store_root)
+    log.info("Audit logs: %s/audit/", config.store_root)
 
     if config.gateway_enabled:
         log.info(
@@ -117,7 +117,7 @@ def _seed_goal(loop, title: str, description: str, priority: int) -> None:
     from .loop.actions import ActionExecutor
     from .models import ExecutiveAction
 
-    executor = ActionExecutor(db=loop._db, workspace=loop._workspace)
+    executor = ActionExecutor(db=loop._db, workspace=loop._workspace, store=loop._store)
     action = ExecutiveAction(
         tool="create_goal",
         params={"title": title, "description": description, "priority": priority},

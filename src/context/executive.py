@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from ..db import Database
 from ..models import Goal, HealthIssue, SessionResult, GOAL_STATUS_ACTIVE
-from ..workspace import Workspace
+from ..store import Store
 
 # ── Caps ───────────────────────────────────────────────────────────────────
 _MAX_ACTIVE_GOALS       = 20    # active goals shown in full
@@ -33,7 +33,7 @@ _MAX_REFLECTIONS        = 3     # recent reflections shown as one-liners
 
 def build(
     db: Database,
-    workspace: Workspace,
+    store: Store,
     current_tick: int,
     last_result: SessionResult | None,
     health_issues: list[HealthIssue],
@@ -144,7 +144,7 @@ def build(
         sections.append("\n".join(lines))
 
     # ── PRIORITIES.md (strategic rationale) ───────────────────────────────
-    priorities = workspace.read_priorities()
+    priorities = store.read_priorities()
     if priorities:
         if len(priorities) > _MAX_PRIORITIES_CHARS:
             priorities = priorities[:_MAX_PRIORITIES_CHARS] + "\n...[truncated — use read_knowledge to see more]"
@@ -167,7 +167,7 @@ def build(
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def _format_active_goal(g: Goal, workspace: Workspace) -> str:
+def _format_active_goal(g: Goal, store: Store) -> str:
     lines = [
         f"\n### [{g.priority}] {g.title} (`{g.goal_id}`)",
         f"**Description:** {g.description}",
@@ -175,7 +175,7 @@ def _format_active_goal(g: Goal, workspace: Workspace) -> str:
     ]
 
     # Checkpoint (truncated)
-    checkpoint = workspace.read_checkpoint(g.workspace_path)
+    checkpoint = store.read_checkpoint(g.workspace_path)
     if checkpoint:
         if len(checkpoint) > _MAX_CHECKPOINT_CHARS:
             checkpoint = checkpoint[:_MAX_CHECKPOINT_CHARS] + "\n...[truncated — use read_checkpoint() for full]"

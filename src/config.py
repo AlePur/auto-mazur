@@ -33,7 +33,13 @@ class Config:
 
     # ── Storage ───────────────────────────────────────────────────────────
     workspace_root: str = "./workspace"
+    store_root: str = "./store"
     db_path: str = "./agent.db"
+
+    # ── User separation ───────────────────────────────────────────────────
+    # When set, shell/read/write tools run as this user (via sudo).
+    # Empty string = run as the current user (local development mode).
+    worker_user: str = ""
 
     # ── Tool limits ───────────────────────────────────────────────────────
     command_timeout_seconds: int = 300
@@ -87,6 +93,9 @@ class Config:
 
     def workspace_path(self) -> Path:
         return Path(self.workspace_root).resolve()
+
+    def store_path(self) -> Path:
+        return Path(self.store_root).resolve()
 
     def db_file(self) -> Path:
         return Path(self.db_path).resolve()

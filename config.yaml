@@ -17,7 +17,12 @@ context_length_tokens: 180000
 
 # Storage paths (relative to cwd, or absolute)
 workspace_root: "./workspace"
+store_root: "./store"
 db_path: "./agent.db"
+
+# User separation — when set, shell/read/write tools run as this user
+# via sudo.  Empty string = run as current user (local development).
+worker_user: ""
 
 # Tool limits — these protect the infrastructure, not the computer
 command_timeout_seconds: 300    # kill shell commands after 5 min

@@ -44,13 +44,13 @@ class AuditLogger:
 
     Parameters
     ----------
-    workspace_root:
-        Root of the agent workspace.  Audit logs are written under
-        ``{workspace_root}/audit/``.
+    store_root:
+        Root of the internal state store.  Audit logs are written under
+        ``{store_root}/audit/``.
     """
 
-    def __init__(self, workspace_root: str | Path) -> None:
-        self._root = Path(workspace_root).resolve()
+    def __init__(self, store_root: str | Path) -> None:
+        self._root = Path(store_root).resolve()
         self._llm_dir = self._root / "audit" / "llm"
         self._tool_dir = self._root / "audit" / "tools"
         self._llm_dir.mkdir(parents=True, exist_ok=True)

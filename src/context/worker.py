@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from ..db import Database
 from ..models import Goal, Task
+from ..store import Store
 from ..workspace import Workspace
 
 # ── Caps ───────────────────────────────────────────────────────────────────
@@ -33,6 +34,7 @@ def build(
     goal: Goal,
     task: Task,
     workspace: Workspace,
+    store: Store,
     db: Database,
     attempt: int = 0,
     previous_summary: str | None = None,
@@ -59,7 +61,7 @@ def build(
     )
 
     # ── Checkpoint (where we left off) — capped ───────────────────────────
-    checkpoint = workspace.read_checkpoint(goal.workspace_path)
+    checkpoint = store.read_checkpoint(goal.workspace_path)
     if checkpoint:
         if len(checkpoint) > _MAX_CHECKPOINT_CHARS:
             checkpoint = checkpoint[:_MAX_CHECKPOINT_CHARS] + "\n...[truncated]"
@@ -75,7 +77,7 @@ def build(
 
     # ── Relevant knowledge (keyword search, capped) ───────────────────────
     keywords = _extract_keywords(task.description, goal.title)
-    relevant = _fetch_relevant_knowledge(keywords, db, workspace)
+    relevant = _fetch_relevant_knowledge(keywords, db, store)
     if relevant:
         lines = ["## Relevant Notes"]
         for topic, content in relevant:
@@ -107,7 +109,7 @@ def _extract_keywords(description: str, title: str) -> str:
 def _fetch_relevant_knowledge(
     query: str,
     db: Database,
-    workspace: Workspace,
+    store: Store,
 ) -> list[tuple[str, str]]:
     """
     Return up to _MAX_KNOWLEDGE_ITEMS (topic, content) pairs.
@@ -124,7 +126,7 @@ def _fetch_relevant_knowledge(
 
     results: list[tuple[str, str]] = []
     for hit in hits:
-        content = workspace.read_knowledge(hit["topic"])
+        content = store.read_knowledge(hit["topic"])
         if content:
             results.append((hit["topic"], content))
 
