@@ -213,8 +213,10 @@ in {
     systemd.services.mazur = {
       description   = "Mazur autonomous LLM agent daemon";
 
-      # bash + sudo must be in PATH so the daemon can exec sudo -u mazur-worker.
-      path = [ pkgs.bash pkgs.sudo ];
+      # bash must be in PATH; sudo is reached via /run/wrappers (the NixOS
+      # setuid-wrapper directory) — pkgs.sudo from the store never has the
+      # setuid bit set and would fail with "must be owned by uid 0".
+      path = [ pkgs.bash "/run/wrappers" ];
       documentation = [ "https://github.com/AlePur/auto-mazur" ];
 
       wantedBy = [ "multi-user.target" ];
