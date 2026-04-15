@@ -80,7 +80,7 @@
       ];
 
       dependencies = with pkgs.python3Packages; [
-        openai
+        httpx
         pyyaml
       ];
 

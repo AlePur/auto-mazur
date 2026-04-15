@@ -158,6 +158,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /status
         if path == "/status":
+            # Response:
+            #   {
+            #     "tick":        int,             -- ID of the last completed tick (0 if none yet)
+            #     "goal_counts": {<status>: int}  -- e.g. {"active": 2, "blocked": 1, "done": 5}
+            #   }
+            # goal_counts only includes statuses that have at least one goal;
+            # possible status keys: "active", "blocked", "done", "abandoned", "paused".
             return {
                 "tick": db.get_last_tick_id(),
                 "goal_counts": db.get_goal_counts_by_status(),
@@ -165,6 +172,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /goals
         if path == "/goals":
+            # Response: [GoalDict, ...]  ordered by priority ASC (1 = highest)
+            # Empty array when no goals exist.
+            # See _goal_dict() for the full GoalDict field list.
             return [_goal_dict(g) for g in db.get_all_goals()]
 
         # /goals/{id}
@@ -176,6 +186,7 @@ class _Handler(BaseHTTPRequestHandler):
 
             if len(parts) == 3:
                 # /goals/{id}
+                # Response: GoalDict  — see _goal_dict() for the full field list.
                 goal = db.get_goal(goal_id)
                 if not goal:
                     raise _NotFound(f"goal {goal_id!r} not found")
@@ -184,12 +195,43 @@ class _Handler(BaseHTTPRequestHandler):
             sub = parts[3] if len(parts) > 3 else ""
 
             if sub == "sessions":
+                # /goals/{id}/sessions?n=20
+                # Response: [SessionRow, ...]  most-recent first (by session_id DESC)
+                # Each SessionRow:
+                #   {
+                #     "session_id":   int,         -- auto-increment integer PK
+                #     "goal_id":      str,
+                #     "status":       str | null,  -- null while session is still open;
+                #                                     terminal values: "done", "stuck",
+                #                                     "max_actions", "error_streak",
+                #                                     "context_overflow", "api_error"
+                #     "summary":      str | null,  -- one-paragraph summary once closed
+                #     "tick_start":   int,
+                #     "tick_end":     int | null,  -- null while still open
+                #     "action_count": int | null   -- tool calls executed; null while open
+                #   }
                 n = _int_qs(qs, "n", 20)
                 return db.get_recent_sessions(n=n, goal_id=goal_id)
 
             if sub == "journals":
                 if len(parts) == 4:
+                    # /goals/{id}/journals  — index only, no file content
+                    # Response: [JournalEntry, ...]  ordered tick_start ASC (oldest first)
+                    # Each JournalEntry:
+                    #   {
+                    #     "goal_id":    str,
+                    #     "tick_start": int,
+                    #     "tick_end":   int,
+                    #     "file_path":  str,  -- relative to workspace root
+                    #     "summary":    str   -- first line of the journal entry
+                    #   }
                     return db.list_journals_for_goal(goal_id)
+                # /goals/{id}/journals/{tick_start}  — full markdown content
+                # Response:
+                #   {
+                #     "file_path": str,   -- relative to workspace root
+                #     "content":   str    -- raw Markdown; "" if file is missing on disk
+                #   }
                 tick_start = parts[4]
                 entries = db.list_journals_for_goal(goal_id)
                 entry = next(
@@ -201,6 +243,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return {"file_path": entry["file_path"], "content": content or ""}
 
             if sub == "checkpoint":
+                # /goals/{id}/checkpoint
+                # Response:
+                #   {
+                #     "content": str  -- full text of CHECKPOINT.md for this goal's workspace;
+                #                        "" if the file has not been written yet
+                #   }
                 goal = db.get_goal(goal_id)
                 if not goal:
                     raise _NotFound(f"goal {goal_id!r} not found")
@@ -211,11 +259,16 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /sessions
         if path == "/sessions":
+            # Response: [SessionRow, ...]  across all goals, most-recent first
+            # SessionRow shape is identical to /goals/{id}/sessions above.
             n = _int_qs(qs, "n", 20)
             return db.get_recent_sessions(n=n)
 
         # /ticks
         if path == "/ticks":
+            # Response: [TickDict, ...]  oldest-first within the returned window
+            # Supports optional ?goal_id=<id> to filter to a single goal.
+            # See _tick_dict() for the full TickDict field list.
             n = _int_qs(qs, "n", 50)
             goal_id = _str_qs(qs, "goal_id")
             ticks = db.get_recent_ticks(n=n, goal_id=goal_id)
@@ -223,6 +276,14 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /knowledge
         if path == "/knowledge":
+            # Response: [KnowledgeEntry, ...]  ordered alphabetically by topic
+            # Each KnowledgeEntry:
+            #   {
+            #     "topic":           str,  -- e.g. "nginx"
+            #     "file_path":       str,  -- relative to workspace root
+            #     "summary":         str,  -- one-line description
+            #     "updated_at_tick": int
+            #   }
             return db.list_knowledge()
 
         if path.startswith("/knowledge/"):
@@ -230,10 +291,23 @@ class _Handler(BaseHTTPRequestHandler):
             content = ws.read_knowledge(topic)
             if content is None:
                 raise _NotFound(f"knowledge topic {topic!r} not found")
+            # Response:
+            #   {
+            #     "topic":   str,  -- same as the URL segment
+            #     "content": str   -- raw Markdown of the knowledge file
+            #   }
             return {"topic": topic, "content": content}
 
         # /reflections
         if path == "/reflections":
+            # Response: [ReflectionEntry, ...]  oldest-first within the returned window
+            # Each ReflectionEntry:
+            #   {
+            #     "tick":           int,
+            #     "trigger_reason": str,  -- why a reflection was triggered
+            #     "file_path":      str,  -- relative to workspace root
+            #     "summary":        str   -- first non-empty line of observations
+            #   }
             n = _int_qs(qs, "n", 10)
             return db.get_recent_reflections(n=n)
 
@@ -244,10 +318,23 @@ class _Handler(BaseHTTPRequestHandler):
             if not entry:
                 raise _NotFound(f"reflection tick={tick_str} not found")
             content = ws.read_reflection_file(entry["file_path"])
+            # Response:
+            #   {
+            #     "tick":    int,
+            #     "content": str  -- raw Markdown of the reflection file;
+            #                        "" if file is missing on disk
+            #   }
             return {"tick": entry["tick"], "content": content or ""}
 
         # /weeklies
         if path == "/weeklies":
+            # Response: [WeeklyEntry, ...]  oldest-first within the returned window
+            # Each WeeklyEntry:
+            #   {
+            #     "tick":      int,
+            #     "file_path": str,  -- relative to workspace root
+            #     "summary":   str   -- first line of the weekly summary
+            #   }
             n = _int_qs(qs, "n", 5)
             return db.get_recent_weeklies(n=n)
 
@@ -258,37 +345,74 @@ class _Handler(BaseHTTPRequestHandler):
             if not entry:
                 raise _NotFound(f"weekly tick={tick_str} not found")
             content = ws.read_weekly_file(entry["file_path"])
+            # Response:
+            #   {
+            #     "tick":    int,
+            #     "content": str  -- raw Markdown of the weekly summary file;
+            #                        "" if file is missing on disk
+            #   }
             return {"tick": entry["tick"], "content": content or ""}
 
         # /outbox
         if path == "/outbox":
+            # Response: [OutboxRow, ...]  oldest-first within the returned window
+            # Each OutboxRow:
+            #   {
+            #     "msg_id":   str,    -- UUID string
+            #     "reply_to": str,    -- inbox msg_id this is a reply to; "" if unsolicited
+            #     "title":    str,
+            #     "content":  str,    -- full message body (Markdown)
+            #     "sent_at":  float   -- Unix timestamp (time.time())
+            #   }
             n = _int_qs(qs, "n", 20)
             return db.get_recent_outbox(n=n)
 
         # /inbox
         if path == "/inbox":
+            # Response: [InboxRow, ...]  oldest-first within the returned window,
+            # includes both answered and unanswered messages.
+            # Each InboxRow:
+            #   {
+            #     "msg_id":      str,           -- UUID string (set by POST /inbox)
+            #     "text":        str,
+            #     "received_at": float,          -- Unix timestamp
+            #     "answered_at": float | null    -- null = not yet answered by the Executive
+            #   }
             n = _int_qs(qs, "n", 20)
             return db.get_recent_inbox(n=n)
 
         # /files/{rel_path} — serve any workspace file
         if path.startswith("/files/"):
             rel = path[len("/files/"):]
+            # Response shape depends on whether the path is a directory or file;
+            # see _serve_file() for the exact shapes.
             return self._serve_file(rel)
 
         # /audit/llm/dates
         if path == "/audit/llm/dates":
+            # Response: ["YYYY-MM-DD", ...]  newest date first
+            # LLM audit files are retained for 2 days (today + yesterday).
+            # Empty array when auditing is disabled.
             if not self.audit:
                 return []
             return self.audit.list_llm_dates()
 
         # /audit/tools/dates
         if path == "/audit/tools/dates":
+            # Response: ["YYYY-MM-DD", ...]  newest date first
+            # Tool audit files are retained for 31 days.
+            # Empty array when auditing is disabled.
             if not self.audit:
                 return []
             return self.audit.list_tool_dates()
 
         # /audit/llm/history
         if path == "/audit/llm/history":
+            # Response: [LLMEntry, ...]  — all entries from the JSONL file for the
+            # requested date, in the order they were written (chronological).
+            # Requires ?date=YYYY-MM-DD.
+            # See /audit/llm for the LLMEntry field list.
+            # Empty array when auditing is disabled or the date file doesn't exist.
             if not self.audit:
                 return []
             date = _str_qs(qs, "date") or ""
@@ -298,6 +422,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /audit/tools/history
         if path == "/audit/tools/history":
+            # Response: [ToolEntry, ...]  — all entries from the JSONL file for
+            # the requested date, in the order they were written (chronological).
+            # Requires ?date=YYYY-MM-DD.
+            # See /audit/tools for the ToolEntry field list.
+            # Empty array when auditing is disabled or the date file doesn't exist.
             if not self.audit:
                 return []
             date = _str_qs(qs, "date") or ""
@@ -307,6 +436,22 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /audit/llm
         if path == "/audit/llm":
+            # Response: [LLMEntry, ...]  from the in-memory ring buffer (last 500),
+            # oldest-first within the returned slice.
+            # Supports ?n=50 (max entries) and ?since=<unix_ts> (exclude older entries).
+            # Each LLMEntry:
+            #   {
+            #     "ts":         float,        -- Unix timestamp of the call
+            #     "actor":      str,          -- "executive" | "worker" | "reflector" | "summarizer"
+            #     "tick_id":    int | null,
+            #     "session_id": int | null,
+            #     "goal_id":    str | null,
+            #     "thinking":   str | null,   -- raw model reasoning chain (audit-only)
+            #     "content":    str | null,   -- text response (null when tool_calls non-empty)
+            #     "tool_calls": [...],        -- list of tool call objects the model requested
+            #     "usage":      {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+            #   }
+            # Empty array when auditing is disabled.
             if not self.audit:
                 return []
             n = _int_qs(qs, "n", 50)
@@ -315,6 +460,23 @@ class _Handler(BaseHTTPRequestHandler):
 
         # /audit/tools
         if path == "/audit/tools":
+            # Response: [ToolEntry, ...]  from the in-memory ring buffer (last 500),
+            # oldest-first within the returned slice.
+            # Supports ?n=100 and ?since=<unix_ts>.
+            # Each ToolEntry:
+            #   {
+            #     "ts":         float,   -- Unix timestamp
+            #     "actor":      str,     -- which agent ran the tool
+            #     "tick_id":    int | null,
+            #     "session_id": int | null,
+            #     "goal_id":    str | null,
+            #     "tool_name":  str,     -- e.g. "shell", "write_file", "read_file"
+            #     "args":       {...},   -- arguments passed to the tool
+            #     "output":     str,     -- raw tool output (may be long)
+            #     "is_error":   bool,
+            #     "truncated":  bool     -- true if output was cut off before sending to agent
+            #   }
+            # Empty array when auditing is disabled.
             if not self.audit:
                 return []
             n = _int_qs(qs, "n", 100)
@@ -327,6 +489,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _route_post(self, path: str, body: dict) -> Any:
         if path == "/inbox":
+            # Request body: {"text": str}  — plain text message to the agent
             text = str(body.get("text", "")).strip()
             if not text:
                 raise _BadRequest("'text' field is required and must not be empty")
@@ -337,6 +500,12 @@ class _Handler(BaseHTTPRequestHandler):
                 received_at=time.time(),
             )
             log.info("Gateway: inbox message %s written: %s", msg_id, text[:80])
+            # Response:
+            #   {
+            #     "msg_id": str,            -- UUID4 assigned to this message;
+            #                                  use it to look up the message in GET /inbox
+            #     "status": "queued"        -- always "queued" on success
+            #   }
             return {"msg_id": msg_id, "status": "queued"}
 
         raise _NotFound(f"unknown POST path {path!r}")
@@ -345,7 +514,32 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _serve_file(self, rel_path: str) -> dict:
         """
-        Serve a file under workspace root.  Guards against path traversal.
+        Serve a file (or directory listing) under workspace root.
+        Guards against path traversal — any path that resolves outside the
+        workspace root is rejected with a 404.
+
+        Directory response:
+            {
+                "path":    str,          -- rel_path as requested
+                "is_dir":  true,
+                "entries": [
+                    {
+                        "name":   str,
+                        "is_dir": bool,
+                        "size":   int    -- bytes; 0 for sub-directories
+                    },
+                    ...                  -- sorted alphabetically by name
+                ]
+            }
+
+        File response:
+            {
+                "path":      str,        -- rel_path as requested
+                "is_dir":    false,
+                "truncated": bool,       -- true when the file exceeds 1 MB (_MAX_FILE_BYTES)
+                "size":      int,        -- actual file size in bytes (even when truncated)
+                "content":   str         -- UTF-8 text; replacement char (U+FFFD) on decode errors
+            }
         """
         root = self.workspace.root
         # Resolve and verify the path stays inside workspace root
@@ -395,9 +589,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: N802
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: N802, A002
         # Route access log through the standard logging system instead of stderr
-        log.debug("gateway %s", fmt % args)
+        log.debug("gateway %s", format % args)
 
 
 # ── Exceptions ─────────────────────────────────────────────────────────────
@@ -413,6 +607,23 @@ class _BadRequest(Exception):
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _goal_dict(goal: Any) -> dict:
+    """
+    Serialize a Goal model to a plain dict for JSON responses.
+
+    Returned shape:
+        {
+            "goal_id":          str,   -- e.g. "goal-007"
+            "title":            str,
+            "description":      str,
+            "status":           str,   -- "active" | "blocked" | "done" | "abandoned" | "paused"
+            "priority":         int,   -- lower = higher priority (1 = top)
+            "created_at_tick":  int,
+            "last_worked_tick": int,   -- 0 if the goal has never been worked on
+            "total_ticks":      int,   -- cumulative ticks spent on this goal
+            "workspace_path":   str,   -- relative to workspace root, e.g. "goals/goal-007-name"
+            "blocked_reason":   str    -- human-readable blocker; "" when not blocked
+        }
+    """
     from .models import Goal
     return {
         "goal_id": goal.goal_id,
@@ -429,6 +640,20 @@ def _goal_dict(goal: Any) -> dict:
 
 
 def _tick_dict(tick: Any) -> dict:
+    """
+    Serialize a TickRecord model to a plain dict for JSON responses.
+
+    Returned shape:
+        {
+            "tick_id":     int,
+            "session_id":  int | null,  -- null for executive / infra ticks
+            "goal_id":     str | null,  -- null for infra ticks
+            "actor":       str,         -- "executive" | "worker" | "reflector" | "summarizer" | "infra"
+            "action_type": str,         -- e.g. "shell", "write", "decision", "reflect", "journal"
+            "summary":     str,         -- one-line description of what happened
+            "outcome":     str          -- "ok" | "error"
+        }
+    """
     return {
         "tick_id": tick.tick_id,
         "session_id": tick.session_id,
@@ -441,6 +666,7 @@ def _tick_dict(tick: Any) -> dict:
 
 
 def _int_qs(qs: dict, key: str, default: int = 0) -> int:
+    """Return the first value of query-string `key` parsed as int, or `default`."""
     vals = qs.get(key)
     if vals:
         try:
@@ -451,6 +677,7 @@ def _int_qs(qs: dict, key: str, default: int = 0) -> int:
 
 
 def _float_qs(qs: dict, key: str, default: float = 0.0) -> float:
+    """Return the first value of query-string `key` parsed as float, or `default`."""
     vals = qs.get(key)
     if vals:
         try:
@@ -461,6 +688,7 @@ def _float_qs(qs: dict, key: str, default: float = 0.0) -> float:
 
 
 def _str_qs(qs: dict, key: str, default: str | None = None) -> str | None:
+    """Return the first value of query-string `key` as a string, or `default`."""
     vals = qs.get(key)
     if vals:
         return vals[0]
