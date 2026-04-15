@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import json
 import logging
+import select
 import subprocess
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -150,14 +153,156 @@ WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
+class PersistentShell:
+    """
+    A single bash login shell kept alive for the duration of a WorkerSession.
+
+    Commands are written to its stdin and output is read until a unique
+    sentinel marker, so the shell process is never torn down between calls.
+    This means cwd, environment variables, shell functions, activated Python
+    venvs, etc. all persist across every shell() call within one session —
+    exactly the behaviour an LLM agent expects.
+
+    The --login flag sources /etc/profile and the per-user profile, giving
+    the mazur user access to all packages listed in users.users.mazur.packages.
+    """
+
+    def __init__(self) -> None:
+        # A unique, unguessable sentinel that cannot plausibly appear in
+        # normal command output.
+        self._sentinel = f"__MAZUR_{uuid.uuid4().hex}__"
+        self._proc: subprocess.Popen | None = None
+        self._start()
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+
+    def _start(self) -> None:
+        """Spawn (or re-spawn) the persistent bash login shell."""
+        self._proc = subprocess.Popen(
+            ["bash", "--login"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,  # line-buffered
+        )
+        # Suppress the prompt and command echo so our sentinel parsing is clean.
+        init = "PS1=''; PS2=''; set +o history\n"
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(init)
+        self._proc.stdin.flush()
+        log.debug("PersistentShell: started pid=%d", self._proc.pid)
+
+    def close(self) -> None:
+        """Gracefully shut down the shell process."""
+        if self._proc is None:
+            return
+        if self._proc.poll() is None:
+            try:
+                self._proc.stdin.write("exit\n")  # type: ignore[union-attr]
+                self._proc.stdin.flush()           # type: ignore[union-attr]
+                self._proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=3)
+                except Exception:
+                    self._proc.kill()
+        self._proc = None
+        log.debug("PersistentShell: closed")
+
+    # ── Command execution ──────────────────────────────────────────────────
+
+    def run(self, command: str, timeout: int) -> tuple[str, int, bool]:
+        """
+        Run *command* inside the persistent shell.
+
+        Returns ``(output, returncode, timed_out)``.
+
+        If the underlying bash process has died between calls it is
+        automatically restarted (state is lost, but we don't crash).
+        """
+        # Auto-restart if the process died
+        if self._proc is None or self._proc.poll() is not None:
+            log.warning("PersistentShell: bash process died, restarting")
+            self._start()
+
+        sentinel = self._sentinel
+        # Write the command followed by a line that prints the sentinel and
+        # the exit code.  printf avoids any flag interpretation issues.
+        wrapped = f"{command}\n__mc=$?; printf '%s %d\\n' '{sentinel}' $__mc\n"
+
+        assert self._proc is not None
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+
+        try:
+            self._proc.stdin.write(wrapped)
+            self._proc.stdin.flush()
+        except BrokenPipeError:
+            log.warning("PersistentShell: stdin broken, restarting")
+            self._start()
+            assert self._proc is not None
+            assert self._proc.stdin is not None
+            self._proc.stdin.write(wrapped)
+            self._proc.stdin.flush()
+
+        # Read output line-by-line until we see the sentinel, subject to the
+        # per-command timeout.  select() lets us do a non-blocking wait so we
+        # can honour the deadline precisely.
+        lines: list[str] = []
+        deadline = time.monotonic() + timeout
+        timed_out = False
+        rc = 0
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+
+            ready, _, _ = select.select([self._proc.stdout], [], [], remaining)
+            if not ready:
+                timed_out = True
+                break
+
+            line = self._proc.stdout.readline()
+            if not line:
+                # EOF — process exited unexpectedly
+                self._proc = None
+                break
+
+            stripped = line.rstrip("\n")
+            # Sentinel line looks like:  __MAZUR_<hex>__ <returncode>
+            if stripped.startswith(sentinel):
+                try:
+                    rc = int(stripped.split()[-1])
+                except (ValueError, IndexError):
+                    rc = 0
+                break
+
+            lines.append(stripped)
+
+        return "\n".join(lines), rc, timed_out
+
+
 class ToolExecutor:
     """
     Executes Worker tool calls.  One instance is shared across the lifetime
     of a WorkerSession.
+
+    A single PersistentShell is kept alive for the whole session so that
+    shell state (cwd, env-vars, venvs, etc.) carries across tool calls.
+    Call close() when the session ends to tear it down.
     """
 
     def __init__(self, config: Config) -> None:
         self._cfg = config
+        self._shell = PersistentShell()
+
+    def close(self) -> None:
+        """Shut down the persistent bash shell.  Call once per session."""
+        self._shell.close()
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         """Dispatch a tool call by name and return a ToolResult."""
@@ -197,24 +342,20 @@ class ToolExecutor:
 
         log.debug("shell: %s", command[:200])
         try:
-            proc = subprocess.run(
-                ["bash", "-c", command],
-                capture_output=True,
-                text=True,
-                timeout=self._cfg.command_timeout_seconds,
+            output, rc, timed_out = self._shell.run(
+                command, self._cfg.command_timeout_seconds
             )
-            output = proc.stdout + proc.stderr
-            is_error = proc.returncode != 0
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                output=(
-                    f"[TIMEOUT — command killed after "
-                    f"{self._cfg.command_timeout_seconds}s]\n"
-                    "Use non-blocking commands or run long jobs in the background."
-                ),
-                is_error=True,
-                truncated=False,
-            )
+            if timed_out:
+                return ToolResult(
+                    output=(
+                        f"[TIMEOUT — command killed after "
+                        f"{self._cfg.command_timeout_seconds}s]\n"
+                        "Use non-blocking commands or run long jobs in the background."
+                    ),
+                    is_error=True,
+                    truncated=False,
+                )
+            is_error = rc != 0
         except Exception as exc:
             return ToolResult(
                 output=f"[ERROR launching command: {exc}]",

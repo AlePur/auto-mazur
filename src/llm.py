@@ -236,13 +236,16 @@ class LLMClient:
             estimated = len(str(msg.get("content") or "")) // _CHARS_PER_TOKEN
             usage = Usage(0, estimated, estimated)
 
-        # Capture reasoning_content (Gemma 4 / vLLM thinking field).
-        # This is stored in LLMResponse.thinking for the audit log ONLY.
-        # It is never injected back into any agent message list.
-        thinking: str | None = msg.get("reasoning_content") or None
+        # Capture the model's reasoning chain for the audit log ONLY.
+        # vLLM exposes this as "reasoning" (observed with Gemma 4); some builds
+        # use "reasoning_content" instead — we check both.  The thinking is
+        # NEVER injected back into any agent message list.
+        thinking: str | None = (
+            msg.get("reasoning") or msg.get("reasoning_content") or None
+        )
 
         return LLMResponse(
-            content=msg.get("content"),
+            content=msg.get("content") or None,
             tool_calls=tool_calls,
             usage=usage,
             raw=raw,

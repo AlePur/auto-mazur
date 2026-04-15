@@ -164,6 +164,11 @@ in {
     # --------------------------------------------------------------------------
     systemd.services.mazur = {
       description   = "Mazur autonomous LLM agent daemon";
+
+      # bash must be in PATH so the service process can exec it as a
+      # persistent login shell.  Everything else comes from the mazur user's
+      # profile (users.users.mazur.packages) via --login.
+      path = [ pkgs.bash ];
       documentation = [ "https://github.com/AlePur/auto-mazur" ];
 
       wantedBy = [ "multi-user.target" ];

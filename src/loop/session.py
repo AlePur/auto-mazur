@@ -304,6 +304,12 @@ class WorkerSession:
     def _end_session(
         self, tick_id: int, status: str, summary: str
     ) -> SessionResult:
+        # Tear down the persistent shell for this session
+        try:
+            self._executor.close()
+        except Exception as exc:
+            log.warning("Failed to close ToolExecutor shell: %s", exc)
+
         # Write out transcript
         transcript_path = self._workspace.transcript_path(
             self._goal.workspace_path, self._session_id
