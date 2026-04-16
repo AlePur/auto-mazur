@@ -332,6 +332,7 @@ class ToolExecutor:
 
     def __init__(self, config: Config, initial_cwd: str = "") -> None:
         self._cfg = config
+        self._initial_cwd = initial_cwd or None
         self._shell = PersistentShell(worker_user=config.worker_user, initial_cwd=initial_cwd)
 
     def close(self) -> None:
@@ -387,6 +388,7 @@ class ToolExecutor:
             input=input,
             capture_output=True,
             timeout=timeout,
+            cwd=self._initial_cwd,
         )
 
     # ── Individual tools ───────────────────────────────────────────────────
