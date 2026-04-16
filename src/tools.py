@@ -409,6 +409,17 @@ class ToolExecutor:
         if not command.strip():
             return ToolResult(output="[empty command]", is_error=True, truncated=False)
 
+        _parts = command.strip().split()
+        if _parts[0] == "ls" and any("R" in p for p in _parts[1:] if p.startswith("-")):
+            return ToolResult(
+                output=(
+                    "ls -R will lead to context flooding or shell timeout "
+                    "in a directory with many files"
+                ),
+                is_error=True,
+                truncated=False,
+            )
+
         log.debug("shell: %s", command[:200])
         try:
             output, rc, timed_out = self._shell.run(
