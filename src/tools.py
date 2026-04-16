@@ -144,7 +144,7 @@ WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Keywords to search for (space-separated).",
+                        "description": "SQLite FTS5 query string. Keywords to search for (space-separated).",
                     }
                 },
                 "required": ["query"],
