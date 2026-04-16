@@ -113,6 +113,7 @@ class LLMClient:
             # Always enable Gemma 4 structured thinking.  The reasoning chain
             # improves answer quality; we discard the tokens, keep only content.
             "chat_template_kwargs": {"enable_thinking": True},
+            "skip_special_tokens": False
         }
         if tools:
             body["tools"] = tools
@@ -138,6 +139,7 @@ class LLMClient:
             "temperature": temperature,
             "response_format": {"type": "json_object"},
             "chat_template_kwargs": {"enable_thinking": True},
+            "skip_special_tokens": False
         }
         raw = self._call_with_retry(body)
         resp = self._parse_response(raw)
