@@ -269,7 +269,7 @@ class ExecutiveTick:
                         f"- session {s['session_id']} "
                         f"[{s.get('status', '?')}] "
                         f"ticks {s['tick_start']}–{s.get('tick_end', '?')}: "
-                        f"{(s.get('summary') or '(no summary)')[:120]}"
+                        f"{(s.get('summary') or '(no summary)')[:1000]}"
                     )
                 return "\n".join(lines)
 
