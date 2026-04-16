@@ -102,7 +102,7 @@ class WorkerSession:
     def run(self) -> SessionResult:
         """Run the session loop to completion."""
         initial_cwd = str(self._workspace.goal_work_dir(self._goal.workspace_path))
-        self._executor = ToolExecutor(self._config, initial_cwd=initial_cwd)
+        self._executor = ToolExecutor(self._config, initial_cwd=initial_cwd, db=self._db)
         self._guard = TurnGuard(llm=self._llm)
         self._init_messages()
         tick_id = self._db.get_last_tick_id() + 1
@@ -240,7 +240,6 @@ class WorkerSession:
                 task=self._task,
                 workspace=self._workspace,
                 store=self._store,
-                db=self._db,
                 attempt=self._attempt,
                 previous_summary=self._prev_summary,
             ),

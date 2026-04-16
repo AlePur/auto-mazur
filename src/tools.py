@@ -1,10 +1,11 @@
 """
 Tool implementations — the Worker's interface to the real world.
 
-Four tools:
+Five tools:
   shell(command)              → run any shell command via bash
   read(path, lines="0-100")  → read a file, optionally a line range
   write(path, content)        → write a file
+  search_knowledge(query)     → FTS5 search over the knowledge base
   finish(summary, status)     → end the session
 
 All three I/O tools (shell, read, write) run as the ``worker_user`` when
@@ -35,10 +36,13 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import Config
 from .models import ToolResult
+
+if TYPE_CHECKING:
+    from .db import Database
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +125,29 @@ WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge",
+            "description": (
+                "Full-text search over the shared knowledge base. "
+                "Use this when you need background information, "
+                "or when you are facing problems with the task. "
+                "Returns up to 5 matching entries (topic + content). "
+                "Call it with a few relevant keywords."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search for (space-separated).",
+                    }
+                },
+                "required": ["query"],
             },
         },
     },
@@ -341,9 +368,15 @@ class ToolExecutor:
     state.
     """
 
-    def __init__(self, config: Config, initial_cwd: str = "") -> None:
+    def __init__(
+        self,
+        config: Config,
+        initial_cwd: str = "",
+        db: "Database | None" = None,
+    ) -> None:
         self._cfg = config
         self._initial_cwd = initial_cwd or None
+        self._db = db
         self._shell = PersistentShell(worker_user=config.worker_user, initial_cwd=initial_cwd)
 
     def close(self) -> None:
@@ -365,6 +398,8 @@ class ToolExecutor:
                     arguments.get("path", ""),
                     arguments.get("content", ""),
                 )
+            case "search_knowledge":
+                return self.search_knowledge(arguments.get("query", ""))
             case "finish":
                 # finish() is intercepted by the session loop before reaching
                 # here, but we handle it gracefully just in case.
@@ -603,6 +638,62 @@ class ToolExecutor:
 
         return ToolResult(
             output=f"Written {len(content):,} chars to {path}",
+            is_error=False,
+            truncated=False,
+        )
+
+    def search_knowledge(self, query: str) -> ToolResult:
+        """
+        Full-text search over the knowledge base via the DB's FTS5 index.
+
+        Returns up to 5 matching entries formatted as topic + content blocks.
+        Content is capped at 800 chars per entry to keep the result bounded.
+        """
+        _MAX_RESULTS = 5
+        _MAX_CONTENT_CHARS = 1000
+
+        if not query.strip():
+            return ToolResult(
+                output="[search_knowledge: empty query]",
+                is_error=True,
+                truncated=False,
+            )
+
+        if self._db is None:
+            return ToolResult(
+                output="[search_knowledge: knowledge base not available]",
+                is_error=True,
+                truncated=False,
+            )
+
+        log.debug("search_knowledge: %s", query[:200])
+        try:
+            hits = self._db.search_knowledge(query, limit=_MAX_RESULTS)
+        except Exception as exc:
+            return ToolResult(
+                output=f"[search_knowledge error: {exc}]",
+                is_error=True,
+                truncated=False,
+            )
+
+        if not hits:
+            return ToolResult(
+                output=f"(no knowledge entries matched {query!r})",
+                is_error=False,
+                truncated=False,
+            )
+
+        lines: list[str] = [f"[{len(hits)} result(s) for {query!r}]"]
+        for hit in hits:
+            topic = hit.get("topic", "(unknown)")
+            content = hit.get("content", "")
+            truncated_content = content[:_MAX_CONTENT_CHARS]
+            if len(content) > _MAX_CONTENT_CHARS:
+                truncated_content += "\n...[truncated]"
+            lines.append(f"\n### {topic}\n{truncated_content}")
+
+        return ToolResult(
+            output="\n".join(lines),
             is_error=False,
             truncated=False,
         )

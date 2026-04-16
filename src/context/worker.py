@@ -11,22 +11,21 @@ It only sees what it needs to do the work:
   - The task description and success criteria
   - Where to find its working directory
   - The checkpoint from last time (capped)
-  - Any relevant knowledge (keyword matched, capped)
   - Previous attempt summary (if this is a retry)
+
+The Worker has a search_knowledge() tool to look up relevant knowledge
+on demand — nothing is pre-injected into the initial context.
 
 All content is capped to keep the initial context bounded.
 """
 
 from __future__ import annotations
 
-from ..db import Database
 from ..models import Goal, Task
 from ..store import Store
 from ..workspace import Workspace
 
 # ── Caps ───────────────────────────────────────────────────────────────────
-_MAX_KNOWLEDGE_ITEMS    = 5     # knowledge files injected
-_MAX_KNOWLEDGE_CHARS    = 800   # chars per knowledge item
 _MAX_CHECKPOINT_CHARS   = 3_000 # chars for checkpoint (full detail for worker)
 
 
@@ -35,7 +34,6 @@ def build(
     task: Task,
     workspace: Workspace,
     store: Store,
-    db: Database,
     attempt: int = 0,
     previous_summary: str | None = None,
 ) -> list[dict]:
@@ -75,56 +73,5 @@ def build(
             "Consider a different approach this time."
         )
 
-    # ── Relevant knowledge (keyword search, capped) ───────────────────────
-    keywords = _extract_keywords(task.description, goal.title)
-    relevant = _fetch_relevant_knowledge(keywords, db)
-    if relevant:
-        lines = ["## Relevant Notes"]
-        for topic, content in relevant:
-            truncated = content[:_MAX_KNOWLEDGE_CHARS]
-            if len(content) > _MAX_KNOWLEDGE_CHARS:
-                truncated += "\n...[truncated]"
-            lines.append(f"### {topic}\n{truncated}")
-        sections.append("\n\n".join(lines))
-
     context = "\n\n---\n\n".join(sections)
     return [{"role": "user", "content": context}]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────
-
-def _extract_keywords(description: str, title: str) -> str:
-    """
-    Build a keyword query string from the task description and goal title.
-    Simple: take the first 10 significant words.
-    """
-    import re
-    stopwords = {"the", "a", "an", "is", "in", "on", "at", "to", "for",
-                 "of", "and", "or", "with", "that", "this", "it", "be", "as"}
-    words = re.findall(r"\b[a-zA-Z]{3,}\b", (title + " " + description).lower())
-    keywords = [w for w in words if w not in stopwords][:10]
-    return " ".join(keywords)
-
-
-def _fetch_relevant_knowledge(
-    query: str,
-    db: Database,
-) -> list[tuple[str, str]]:
-    """
-    Return up to _MAX_KNOWLEDGE_ITEMS (topic, content) pairs.
-    Uses FTS5 search from the DB; content is returned directly in the search result.
-    """
-    if not query.strip():
-        return []
-
-    try:
-        hits = db.search_knowledge(query, limit=_MAX_KNOWLEDGE_ITEMS)
-    except Exception:
-        # FTS5 search can fail on odd queries — gracefully return nothing
-        return []
-
-    return [
-        (hit["topic"], hit["content"])
-        for hit in hits
-        if hit.get("content")
-    ]
