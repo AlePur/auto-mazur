@@ -45,8 +45,8 @@ class Config:
     command_timeout_seconds: int = 300
     max_output_bytes: int = 102_400   # 100 KB for shell output
     max_read_bytes: int = 102_400     # 100 KB raw byte cap for file reads
-    max_read_chars: int = 30_000      # hard char cap for read tool (~7 500 tokens); 0 = use bytes cap only
-    max_read_lines: int = 100         # default lines returned when no range given
+    max_read_chars: int = 0           # hard char cap for read tool (~7 500 tokens); 0 = use bytes cap only
+    max_read_lines: int = 500         # default lines returned when no range given
 
     # ── Worker session ────────────────────────────────────────────────────
     max_actions_per_session: int = 200

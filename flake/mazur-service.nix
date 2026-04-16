@@ -38,8 +38,8 @@ let
     command_timeout_seconds: 120
     max_output_bytes:        102400
     max_read_bytes:          102400
-    max_read_chars:          30000
-    max_read_lines:          100
+    max_read_chars:          0
+    max_read_lines:          500
 
     # Worker session
     max_actions_per_session:          200

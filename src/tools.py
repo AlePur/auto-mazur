@@ -15,9 +15,8 @@ state (Store) is owned by a different user and is invisible to these tools.
 When ``worker_user`` is empty (local development), all tools run as the
 current process user — no sudo involved.
 
-The read tool always applies two caps (whichever is more restrictive):
-  - lines range (default first 100 lines, configurable via config.max_read_lines)
-  - hard character cap (config.max_read_chars, ~7 500 tokens)
+The read tool applies a line-range default (config.max_read_lines, default 500)
+and an optional hard character cap (config.max_read_chars; 0 = disabled).
 
 Output always includes file metadata so the Worker knows the full file size
 and can issue follow-up reads with a different line range.
@@ -75,7 +74,7 @@ WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "read",
             "description": (
                 "Read the contents of a file. "
-                "By default returns the first 100 lines. "
+                "By default returns the first 500 lines. "
                 "Use the `lines` parameter to read a specific range, e.g. '100-200'. "
                 "Output always includes a header showing total file size so you can "
                 "plan follow-up reads for large files."
@@ -92,7 +91,7 @@ WORKER_TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": (
                             "Line range to return, zero-indexed, inclusive. "
                             "Format: 'START-END', e.g. '0-100', '200-300', '500-600'. "
-                            "Omit to get the default first 100 lines."
+                            "Omit to get the default first 500 lines."
                         ),
                     },
                 },
