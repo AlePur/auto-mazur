@@ -6,11 +6,13 @@ Public API: the `Database` class.  No raw SQL leaks outside this module.
 Schema notes:
   - ticks are the fundamental unit; session_id is nullable (Executive
     actions are not inside sessions)
-  - FTS5 virtual table `knowledge_fts` enables fast keyword search over
-    knowledge file contents indexed here
+  - knowledge_index stores full Markdown content in the DB; FTS5 virtual
+    table `knowledge_fts` (content table backed by knowledge_index) enables
+    fast keyword search — rebuilt explicitly on every upsert
   - journal_index / reflection_index / weekly_index provide lightweight
     metadata for content files that live on disk as markdown
-  - We deliberately avoid storing large blobs; transcripts live on disk
+  - Large blobs (session transcripts) live on disk; knowledge content is
+    an exception since it is small and benefits from indexed search
 """
 
 from __future__ import annotations
@@ -24,7 +26,6 @@ from typing import Generator
 
 from .models import (
     Goal,
-    GoalStatusChange,
     SessionResult,
     Task,
     TickRecord,
@@ -87,15 +88,16 @@ CREATE INDEX IF NOT EXISTS idx_ticks_session    ON ticks(session_id);
 CREATE INDEX IF NOT EXISTS idx_ticks_actor      ON ticks(actor);
 CREATE INDEX IF NOT EXISTS idx_ticks_desc       ON ticks(tick_id DESC);
 
--- Lightweight knowledge index — path + one-line summary for fast listing
+-- Knowledge index — full content stored in DB (no disk files)
 CREATE TABLE IF NOT EXISTS knowledge_index (
-    topic       TEXT PRIMARY KEY,   -- e.g. "nginx"
-    file_path   TEXT NOT NULL,      -- relative path inside workspace
-    summary     TEXT NOT NULL DEFAULT '',
+    topic           TEXT PRIMARY KEY,   -- e.g. "nginx"
+    content         TEXT NOT NULL DEFAULT '',
+    summary         TEXT NOT NULL DEFAULT '',
     updated_at_tick INTEGER NOT NULL DEFAULT 0
 );
 
--- FTS5 over knowledge content for keyword search
+-- FTS5 over knowledge content for keyword search.
+-- content table backed by knowledge_index; rebuilt explicitly after each upsert.
 CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
     topic,
     content,
@@ -443,27 +445,42 @@ class Database:
     # ── Knowledge index ────────────────────────────────────────────────────
 
     def upsert_knowledge(
-        self, topic: str, file_path: str, summary: str, tick: int
+        self, topic: str, content: str, summary: str, tick: int
     ) -> None:
+        """Insert or update a knowledge entry and rebuild the FTS index."""
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO knowledge_index (topic, file_path, summary, updated_at_tick)
+                INSERT INTO knowledge_index (topic, content, summary, updated_at_tick)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(topic) DO UPDATE SET
-                  file_path      = excluded.file_path,
-                  summary        = excluded.summary,
+                  content         = excluded.content,
+                  summary         = excluded.summary,
                   updated_at_tick = excluded.updated_at_tick
                 """,
-                (topic, file_path, summary, tick),
+                (topic, content, summary, tick),
             )
+            # Rebuild FTS index so search_knowledge() stays in sync.
+            # A full rebuild is acceptable here — knowledge files are few.
+            cur.execute("INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')")
+
+    def get_knowledge(self, topic: str) -> str | None:
+        """Return the full content of a knowledge entry, or None if not found."""
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT content FROM knowledge_index WHERE topic = ?", (topic,)
+            ).fetchone()
+        return row["content"] if row else None
 
     def search_knowledge(self, query: str, limit: int = 5) -> list[dict]:
-        """FTS5 keyword search over knowledge content."""
+        """FTS5 keyword search over knowledge content.
+
+        Returns dicts with keys: topic, content, summary.
+        """
         with self._cursor() as cur:
             rows = cur.execute(
                 """
-                SELECT k.topic, k.file_path, k.summary
+                SELECT k.topic, k.content, k.summary
                 FROM knowledge_fts f
                 JOIN knowledge_index k ON k.rowid = f.rowid
                 WHERE knowledge_fts MATCH ?
@@ -474,9 +491,10 @@ class Database:
         return [dict(r) for r in rows]
 
     def list_knowledge(self) -> list[dict]:
+        """Return all knowledge entries (topic, summary, updated_at_tick) ordered by topic."""
         with self._cursor() as cur:
             rows = cur.execute(
-                "SELECT topic, file_path, summary, updated_at_tick "
+                "SELECT topic, summary, updated_at_tick "
                 "FROM knowledge_index ORDER BY topic"
             ).fetchall()
         return [dict(r) for r in rows]

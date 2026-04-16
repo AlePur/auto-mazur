@@ -224,8 +224,8 @@ class ExecutiveTick:
 
             case "read_knowledge":
                 topic = str(args.get("topic", ""))
-                content = self._store.read_knowledge(topic)
-                return content or f"(no knowledge file for topic {topic!r})"
+                content = self._db.get_knowledge(topic)
+                return content or f"(no knowledge entry for topic {topic!r})"
 
             case "search_knowledge":
                 query = str(args.get("query", ""))

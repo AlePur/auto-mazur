@@ -294,7 +294,6 @@ class _Handler(BaseHTTPRequestHandler):
             # Each KnowledgeEntry:
             #   {
             #     "topic":           str,  -- e.g. "nginx"
-            #     "file_path":       str,  -- relative to workspace root
             #     "summary":         str,  -- one-line description
             #     "updated_at_tick": int
             #   }
@@ -302,13 +301,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/knowledge/"):
             topic = path[len("/knowledge/"):]
-            content = store.read_knowledge(topic)
+            content = db.get_knowledge(topic)
             if content is None:
                 raise _NotFound(f"knowledge topic {topic!r} not found")
             # Response:
             #   {
             #     "topic":   str,  -- same as the URL segment
-            #     "content": str   -- raw Markdown of the knowledge file
+            #     "content": str   -- raw Markdown of the knowledge entry
             #   }
             return {"topic": topic, "content": content}
 

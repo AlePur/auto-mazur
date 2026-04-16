@@ -77,7 +77,7 @@ def build(
 
     # ── Relevant knowledge (keyword search, capped) ───────────────────────
     keywords = _extract_keywords(task.description, goal.title)
-    relevant = _fetch_relevant_knowledge(keywords, db, store)
+    relevant = _fetch_relevant_knowledge(keywords, db)
     if relevant:
         lines = ["## Relevant Notes"]
         for topic, content in relevant:
@@ -109,11 +109,10 @@ def _extract_keywords(description: str, title: str) -> str:
 def _fetch_relevant_knowledge(
     query: str,
     db: Database,
-    store: Store,
 ) -> list[tuple[str, str]]:
     """
     Return up to _MAX_KNOWLEDGE_ITEMS (topic, content) pairs.
-    Uses FTS5 search from the DB index; reads actual content from disk.
+    Uses FTS5 search from the DB; content is returned directly in the search result.
     """
     if not query.strip():
         return []
@@ -124,10 +123,8 @@ def _fetch_relevant_knowledge(
         # FTS5 search can fail on odd queries — gracefully return nothing
         return []
 
-    results: list[tuple[str, str]] = []
-    for hit in hits:
-        content = store.read_knowledge(hit["topic"])
-        if content:
-            results.append((hit["topic"], content))
-
-    return results
+    return [
+        (hit["topic"], hit["content"])
+        for hit in hits
+        if hit.get("content")
+    ]

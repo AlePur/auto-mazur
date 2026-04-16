@@ -2,11 +2,14 @@
 Store — internal state management for the agent daemon.
 
 All file operations that are part of the agent's *memory* (checkpoints,
-journals, knowledge, transcripts, meta documents) go through here.
+journals, transcripts, meta documents) go through here.
 These files are owned by the ``mazur`` daemon user and are NOT accessible
 to the ``mazur-worker`` user that executes agent tool calls.  This
 separation prevents the agent from reading, modifying, or deleting its own
 internal state through its shell/read/write tools.
+
+Knowledge is stored entirely in the database (knowledge_index + FTS5); there
+are no knowledge files on disk.
 
 Directory layout (relative to store_root, default /var/lib/mazur):
   goals/
@@ -16,8 +19,6 @@ Directory layout (relative to store_root, default /var/lib/mazur):
         <tick_start>-<tick_end>.md
       sessions/
         session-<id>.jsonl[.gz]
-  knowledge/
-    <topic>.md
   meta/
     PRIORITIES.md
     reflections/
@@ -40,7 +41,6 @@ log = logging.getLogger(__name__)
 # Top-level dirs created on init
 _TOP_DIRS = [
     "goals",
-    "knowledge",
     "meta",
     "meta/reflections",
     "meta/summaries",
@@ -129,20 +129,6 @@ class Store:
         if not journal_dir.exists():
             return []
         return sorted(journal_dir.glob("*.md"))
-
-    # ── Knowledge ──────────────────────────────────────────────────────────
-
-    def write_knowledge(self, topic: str, content: str) -> Path:
-        path = self.root / "knowledge" / f"{topic}.md"
-        path.write_text(content, encoding="utf-8")
-        return path
-
-    def read_knowledge(self, topic: str) -> str | None:
-        path = self.root / "knowledge" / f"{topic}.md"
-        return path.read_text(encoding="utf-8") if path.exists() else None
-
-    def list_knowledge_files(self) -> list[Path]:
-        return sorted((self.root / "knowledge").glob("*.md"))
 
     # ── Meta — Priorities ──────────────────────────────────────────────────
 

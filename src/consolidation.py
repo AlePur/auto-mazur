@@ -297,7 +297,6 @@ class Consolidation:
         # Apply knowledge updates
         for ku in result.knowledge_updates:
             try:
-                path = self._store.write_knowledge(ku.topic, ku.content)
                 summary_line = next(
                     (
                         line.strip()
@@ -308,11 +307,11 @@ class Consolidation:
                 )[:120]
                 self._db.upsert_knowledge(
                     topic=ku.topic,
-                    file_path=str(path.relative_to(self._store.root)),
+                    content=ku.content,
                     summary=summary_line,
                     tick=current_tick,
                 )
-                log.info("Reflector: updated knowledge/%s.md", ku.topic)
+                log.info("Reflector: updated knowledge topic %r", ku.topic)
             except Exception as exc:
                 log.error("Failed to write knowledge %s: %s", ku.topic, exc)
 
