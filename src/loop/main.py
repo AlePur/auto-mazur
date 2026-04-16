@@ -4,10 +4,10 @@ MainLoop — the top-level forever loop.
 Orchestrates:
   1. Health check
   2. Executive tick → list of actions
-  3. Execute actions (goal creation, task assignment, responses, reflection)
+  3. Execute actions (goal creation, task assignment, responses, journaling requests)
   4. If a task was assigned: run a WorkerSession
   5. Post-session state updates (goal tick counts, checkpoint)
-  6. Consolidation (journal, archive, reflection — based on tick schedule)
+  6. Consolidation (journal, archive — based on tick schedule or on-demand)
   7. Increment tick counter and repeat
 
 The tick counter is the system clock.  It is persisted to the DB after
@@ -80,6 +80,8 @@ class MainLoop:
             llm=self._llm,
             db=self._db,
             store=self._store,
+            workspace=self._workspace,
+            audit=audit,
         )
         self._action_executor = ActionExecutor(
             db=self._db,
@@ -172,6 +174,7 @@ class MainLoop:
 
         # 4. Execute actions
         task_to_run: Task | None = None
+        journaling_goals: list[str] = []
 
         for action_result in (self._action_executor.execute(a) for a in actions):
             if action_result.error:
@@ -189,10 +192,8 @@ class MainLoop:
                         "subsequent tasks will be re-assigned next tick"
                     )
 
-            if action_result.reflection_requested:
-                self._consolidation.request_reflection(
-                    action_result.action.params.get("reason", "executive request")
-                )
+            if action_result.journaling_requested_for:
+                journaling_goals.append(action_result.journaling_requested_for)
 
             if action_result.outbox_entry:
                 self._deliver_outbox(action_result.outbox_entry)
@@ -202,11 +203,17 @@ class MainLoop:
             session_result = self._run_worker_session(task_to_run, tick)
             self._last_result = session_result
             tick = self._tick  # session updated tick in place
+            # Run post-session consolidation (checkpoint + auto-journal + weekly + archive)
+            self._consolidation.run(session_result, tick)
         else:
             self._last_result = None
 
-        # 6. Consolidation
-        self._consolidation.maybe_run(tick)
+        # 6. On-demand journaling requested by Executive
+        for goal_id in journaling_goals:
+            try:
+                self._consolidation.journal_goal(goal_id, tick)
+            except Exception as exc:
+                log.error("journal_goal(%r) failed: %s", goal_id, exc)
 
         # 7. Advance tick counter
         self._tick = tick + 1

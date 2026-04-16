@@ -5,7 +5,8 @@ The Executive is the only character that:
   - Knows about all goals
   - Knows about the user inbox/outbox
   - Makes resource-allocation decisions
-  - Knows about health issues and reflector observations
+  - Writes and manages knowledge
+  - Requests journaling via the Summarizer
 
 It operates in a two-phase loop each tick:
   1. Query phase — call read-only query tools to gather more detail
@@ -18,7 +19,6 @@ or max_executive_queries is reached, then executes the actions.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -30,20 +30,18 @@ log = logging.getLogger(__name__)
 # ── Tool name constants ────────────────────────────────────────────────────
 
 # Query tools (read-only, no state mutation)
-EXEC_QUERY_READ_CHECKPOINT = "read_checkpoint"
-EXEC_QUERY_READ_JOURNAL    = "read_journal"
-EXEC_QUERY_READ_KNOWLEDGE  = "read_knowledge"
-EXEC_QUERY_SEARCH_KNOWLEDGE = "search_knowledge"
-EXEC_QUERY_LIST_SESSIONS   = "list_sessions"
-EXEC_QUERY_READ_REFLECTION = "read_reflection"
+EXEC_QUERY_READ_JOURNAL      = "read_journal"
+EXEC_QUERY_READ_KNOWLEDGE    = "read_knowledge"
+EXEC_QUERY_SEARCH_KNOWLEDGE  = "search_knowledge"
+EXEC_QUERY_LIST_SESSIONS     = "list_sessions"
+EXEC_QUERY_READ_FILE         = "read_file"
 
 EXEC_QUERY_TOOLS = {
-    EXEC_QUERY_READ_CHECKPOINT,
     EXEC_QUERY_READ_JOURNAL,
     EXEC_QUERY_READ_KNOWLEDGE,
     EXEC_QUERY_SEARCH_KNOWLEDGE,
     EXEC_QUERY_LIST_SESSIONS,
-    EXEC_QUERY_READ_REFLECTION,
+    EXEC_QUERY_READ_FILE,
 }
 
 # ── System prompt ─────────────────────────────────────────────────────────
@@ -53,26 +51,6 @@ SYSTEM_PROMPT = (Path(__file__).parent.parent / "souls" / "executive.md").read_t
 # ── Query tool schemas ─────────────────────────────────────────────────────
 
 QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_checkpoint",
-            "description": (
-                "Read the full CHECKPOINT.md for a goal. "
-                "Use this when the truncated checkpoint in the briefing is not enough."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "goal_id": {
-                        "type": "string",
-                        "description": "ID of the goal to read the checkpoint for.",
-                    }
-                },
-                "required": ["goal_id"],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -98,13 +76,13 @@ QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_knowledge",
-            "description": "Read the full content of a knowledge file by topic name.",
+            "description": "Read the full content of a knowledge entry by topic name.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "description": "The knowledge topic (file stem), e.g. 'nginx'.",
+                        "description": "The knowledge topic, e.g. 'nginx'.",
                     }
                 },
                 "required": ["topic"],
@@ -115,7 +93,7 @@ QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_knowledge",
-            "description": "Full-text search across all knowledge files.",
+            "description": "Full-text search across all knowledge entries.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -152,20 +130,31 @@ QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "read_reflection",
+            "name": "read_file",
             "description": (
-                "Read the content of recent reflection entries. "
-                "Useful when you need the full strategic analysis from a past reflection."
+                "Read a file from the workspace. "
+                "Paths are relative to the workspace root (e.g. 'goals/goal-001-slug/src/main.py'). "
+                "Absolute paths are also accepted. "
+                "By default returns the first 100 lines. "
+                "Use the `lines` parameter to read a specific range, e.g. '100-200'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "n": {
-                        "type": "integer",
-                        "description": "Number of recent reflections to read (default 2, max 5).",
-                    }
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file (relative to workspace root or absolute).",
+                    },
+                    "lines": {
+                        "type": "string",
+                        "description": (
+                            "Line range to return, zero-indexed, inclusive. "
+                            "Format: 'START-END', e.g. '0-100', '200-300'. "
+                            "Omit for default first 100 lines."
+                        ),
+                    },
                 },
-                "required": [],
+                "required": ["path"],
             },
         },
     },
@@ -179,9 +168,11 @@ ACTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "assign_task",
             "description": (
-                "Assign a concrete task to the Worker. "
-                "The Worker will execute shell commands and file operations "
-                "until the task is done or it gets stuck."
+                "Assign a concrete task to the Worker for a goal. "
+                "The Worker executes shell commands and file operations "
+                "until the task is done or it gets stuck. "
+                "Goals are long-running projects — assign incremental tasks "
+                "and continue working on the same goal across many sessions."
             ),
             "parameters": {
                 "type": "object",
@@ -214,7 +205,11 @@ ACTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "create_goal",
-            "description": "Create a new goal with a workspace directory.",
+            "description": (
+                "Create a new long-running goal with a workspace directory. "
+                "Goals represent ongoing projects or objectives that may require "
+                "many sessions over time to complete."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -240,15 +235,24 @@ ACTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "update_goal",
             "description": (
-                "Update a goal's status, priority, or blocked_reason. "
-                "Use status='done' when a goal is fully complete, "
-                "'blocked' when waiting for something external, "
+                "Update a goal's title, description, status, priority, or blocked_reason. "
+                "Use status='done' only when the full goal objective is achieved — "
+                "not just because one session completed. "
+                "Use 'blocked' when waiting for something external, "
                 "'paused' to defer it, 'abandoned' to drop it."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "goal_id": {"type": "string"},
+                    "title": {
+                        "type": "string",
+                        "description": "New title for the goal.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Updated description of what this goal is about.",
+                    },
                     "status": {
                         "type": "string",
                         "enum": ["active", "blocked", "paused", "done", "abandoned"],
@@ -301,22 +305,72 @@ ACTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "request_reflection",
+            "name": "request_journaling",
             "description": (
-                "Trigger a Reflector pass. Use this when: priorities seem off, "
-                "after a long run of failures, after completing a major goal, "
-                "or when you feel lost. "
-                "The Reflector will update priorities and knowledge files."
+                "Request the Summarizer to write a journal entry for a goal. "
+                "Use this after a productive run of sessions, when you want to "
+                "capture progress before the goal's automatic journal threshold is reached, "
+                "or before a long break from working on a goal."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "reason": {
+                    "goal_id": {
                         "type": "string",
-                        "description": "Why you're requesting reflection.",
+                        "description": "ID of the goal to journal.",
                     }
                 },
-                "required": ["reason"],
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_knowledge",
+            "description": (
+                "Write or update a knowledge entry. "
+                "Use this to record important facts, system details, learned patterns, "
+                "or reusable information that will be useful for future Worker sessions. "
+                "Knowledge is automatically surfaced to Workers via keyword search. "
+                "Content should be Markdown, with a clear heading."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": (
+                            "Short identifier for the topic, e.g. 'nginx', 'postgres-backups', "
+                            "'deployment-process'. Used as the lookup key."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full Markdown content of the knowledge entry.",
+                    },
+                },
+                "required": ["topic", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_knowledge",
+            "description": (
+                "Delete a knowledge entry permanently. "
+                "Use this when information is outdated, incorrect, or no longer relevant."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "The topic key to delete.",
+                    }
+                },
+                "required": ["topic"],
             },
         },
     },

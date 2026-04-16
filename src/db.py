@@ -499,6 +499,18 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def delete_knowledge(self, topic: str) -> bool:
+        """Delete a knowledge entry by topic and rebuild the FTS index.
+
+        Returns True if the row existed and was deleted, False if not found.
+        """
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM knowledge_index WHERE topic = ?", (topic,))
+            deleted = cur.rowcount > 0
+            if deleted:
+                cur.execute("INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')")
+        return deleted
+
     # ── Journal index ──────────────────────────────────────────────────────
 
     def upsert_journal(

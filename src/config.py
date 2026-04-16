@@ -62,8 +62,8 @@ class Config:
 
     # ── Consolidation schedule (ticks) ────────────────────────────────────
     checkpoint_interval: int = 50
-    journal_interval: int = 500
-    reflection_interval: int = 2_000
+    # Auto-journal a goal when it accumulates this many ticks since last journal.
+    journal_activity_threshold: int = 100
     weekly_summary_interval: int = 5_000
     archive_interval: int = 50_000
 

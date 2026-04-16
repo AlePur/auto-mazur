@@ -87,7 +87,6 @@ class SessionResult:
 
 ACTOR_EXECUTIVE = "executive"
 ACTOR_WORKER = "worker"
-ACTOR_REFLECTOR = "reflector"
 ACTOR_SUMMARIZER = "summarizer"
 ACTOR_INFRA = "infra"
 
@@ -99,7 +98,7 @@ OUTCOME_ERROR = "error"
 class TickRecord:
     tick_id: int
     actor: str              # ACTOR_*
-    action_type: str        # e.g. "shell", "write", "decision", "reflect", "journal"
+    action_type: str        # e.g. "shell", "write", "decision", "journal"
     summary: str            # ONE line — what happened
     outcome: str            # OUTCOME_OK | OUTCOME_ERROR
     session_id: int | None = None
@@ -120,43 +119,23 @@ class ExecutiveAction:
 
 
 # Executive tool names (mirrors the function-calling schema in characters/executive.py)
-EXEC_TOOL_ASSIGN_TASK = "assign_task"
-EXEC_TOOL_CREATE_GOAL = "create_goal"
-EXEC_TOOL_UPDATE_GOAL = "update_goal"
-EXEC_TOOL_SEND_USER_MESSAGE = "send_user_message"
-EXEC_TOOL_REQUEST_REFLECTION = "request_reflection"
+EXEC_TOOL_ASSIGN_TASK         = "assign_task"
+EXEC_TOOL_CREATE_GOAL         = "create_goal"
+EXEC_TOOL_UPDATE_GOAL         = "update_goal"
+EXEC_TOOL_SEND_USER_MESSAGE   = "send_user_message"
+EXEC_TOOL_REQUEST_JOURNALING  = "request_journaling"
+EXEC_TOOL_WRITE_KNOWLEDGE     = "write_knowledge"
+EXEC_TOOL_FORGET_KNOWLEDGE    = "forget_knowledge"
 
 EXEC_TOOLS = {
     EXEC_TOOL_ASSIGN_TASK,
     EXEC_TOOL_CREATE_GOAL,
     EXEC_TOOL_UPDATE_GOAL,
     EXEC_TOOL_SEND_USER_MESSAGE,
-    EXEC_TOOL_REQUEST_REFLECTION,
+    EXEC_TOOL_REQUEST_JOURNALING,
+    EXEC_TOOL_WRITE_KNOWLEDGE,
+    EXEC_TOOL_FORGET_KNOWLEDGE,
 }
-
-
-# ── Reflector output ──────────────────────────────────────────────────────
-
-@dataclass
-class KnowledgeUpdate:
-    topic: str      # filename stem under knowledge/, e.g. "nginx" → knowledge/nginx.md
-    content: str    # full markdown content to write
-
-
-@dataclass
-class GoalStatusChange:
-    goal_id: str
-    new_status: str
-    reason: str
-
-
-@dataclass
-class ReflectorResult:
-    priority_updates: list[tuple[str, int]]  # [(goal_id, new_priority), …]
-    goal_status_changes: list[GoalStatusChange]
-    knowledge_updates: list[KnowledgeUpdate]
-    priorities_md: str | None   # if set, overwrite meta/PRIORITIES.md wholesale
-    observations: str           # free-text notes, appended to meta/REFLECTIONS.md
 
 
 # ── Health ────────────────────────────────────────────────────────────────

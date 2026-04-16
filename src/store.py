@@ -20,9 +20,6 @@ Directory layout (relative to store_root, default /var/lib/mazur):
       sessions/
         session-<id>.jsonl[.gz]
   meta/
-    PRIORITIES.md
-    reflections/
-      reflection-<tick>.md
     summaries/
       weekly-<tick>.md
   archive/
@@ -42,7 +39,6 @@ log = logging.getLogger(__name__)
 _TOP_DIRS = [
     "goals",
     "meta",
-    "meta/reflections",
     "meta/summaries",
     "archive",
 ]
@@ -129,38 +125,6 @@ class Store:
         if not journal_dir.exists():
             return []
         return sorted(journal_dir.glob("*.md"))
-
-    # ── Meta — Priorities ──────────────────────────────────────────────────
-
-    def write_priorities(self, content: str) -> None:
-        (self.root / "meta" / "PRIORITIES.md").write_text(content, encoding="utf-8")
-
-    def read_priorities(self) -> str | None:
-        path = self.root / "meta" / "PRIORITIES.md"
-        return path.read_text(encoding="utf-8") if path.exists() else None
-
-    # ── Meta — Reflections (one file per reflection) ───────────────────────
-
-    def write_reflection(self, tick: int, content: str) -> Path:
-        """Write a single reflection to its own file. Returns the path."""
-        path = self.root / "meta" / "reflections" / f"reflection-{tick}.md"
-        path.write_text(content, encoding="utf-8")
-        return path
-
-    def read_reflection_file(self, file_path: str) -> str | None:
-        """Read a reflection file by its store-relative path."""
-        path = self.root / file_path
-        return path.read_text(encoding="utf-8") if path.exists() else None
-
-    def read_recent_reflections(self, n: int) -> list[str]:
-        """Return content of the n most-recent reflection files (oldest first).
-        Legacy helper — prefer DB-backed get_recent_reflections() + read_reflection_file().
-        """
-        reflections_dir = self.root / "meta" / "reflections"
-        if not reflections_dir.exists():
-            return []
-        files = sorted(reflections_dir.glob("reflection-*.md"))[-n:]
-        return [f.read_text(encoding="utf-8") for f in files]
 
     # ── Meta — Weekly summaries ────────────────────────────────────────────
 

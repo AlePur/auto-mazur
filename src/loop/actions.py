@@ -8,12 +8,15 @@ will run through the WorkerSession (not executed here).
 assign_task is special: it is returned to the main loop rather than executed
 here, because running a Worker session requires the full machinery of
 session.py and is the responsibility of loop/main.py.
+
+request_journaling is also deferred: it signals the main loop to trigger
+the Summarizer for a specific goal after this tick's actions are complete.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..db import Database
@@ -21,9 +24,11 @@ from ..models import (
     ACTOR_EXECUTIVE,
     EXEC_TOOL_ASSIGN_TASK,
     EXEC_TOOL_CREATE_GOAL,
-    EXEC_TOOL_REQUEST_REFLECTION,
+    EXEC_TOOL_FORGET_KNOWLEDGE,
+    EXEC_TOOL_REQUEST_JOURNALING,
     EXEC_TOOL_SEND_USER_MESSAGE,
     EXEC_TOOL_UPDATE_GOAL,
+    EXEC_TOOL_WRITE_KNOWLEDGE,
     ExecutiveAction,
     GOAL_STATUS_ACTIVE,
     Goal,
@@ -41,9 +46,9 @@ log = logging.getLogger(__name__)
 class ActionResult:
     """Outcome of executing one ExecutiveAction."""
     action: ExecutiveAction
-    task: Task | None = None            # set only for assign_task
-    reflection_requested: bool = False  # set only for request_reflection
-    outbox_entry: dict | None = None    # set only for respond
+    task: Task | None = None                    # set only for assign_task
+    journaling_requested_for: str | None = None # set only for request_journaling
+    outbox_entry: dict | None = None            # set only for send_user_message
     error: str | None = None
 
 
@@ -66,11 +71,12 @@ class ActionExecutor:
                     return self._update_goal(action)
                 case "send_user_message":
                     return self._send_user_message(action)
-                case "request_reflection":
-                    return ActionResult(
-                        action=action,
-                        reflection_requested=True,
-                    )
+                case "request_journaling":
+                    return self._request_journaling(action)
+                case "write_knowledge":
+                    return self._write_knowledge(action)
+                case "forget_knowledge":
+                    return self._forget_knowledge(action)
                 case _:
                     log.warning("Unknown action tool: %r", action.tool)
                     return ActionResult(action=action, error=f"unknown tool: {action.tool}")
@@ -149,6 +155,10 @@ class ActionExecutor:
             return ActionResult(action=action, error="update_goal: missing goal_id")
 
         updates: dict[str, Any] = {}
+        if "title" in params:
+            updates["title"] = str(params["title"])
+        if "description" in params:
+            updates["description"] = str(params["description"])
         if "status" in params:
             updates["status"] = str(params["status"])
         if "priority" in params:
@@ -174,9 +184,6 @@ class ActionExecutor:
         if not content:
             return ActionResult(action=action, error="send_user_message: missing content")
 
-        # The outbox is written by the main loop (_deliver_outbox).
-        # We also carry re_message_id so the main loop can mark the inbox
-        # message as answered.
         entry = {
             "title": title,
             "content": content,
@@ -187,3 +194,56 @@ class ActionExecutor:
             title, re_message_id or "(unprompted)", content[:80],
         )
         return ActionResult(action=action, outbox_entry=entry)
+
+    def _request_journaling(self, action: ExecutiveAction) -> ActionResult:
+        goal_id = str(action.params.get("goal_id", "")).strip()
+        if not goal_id:
+            return ActionResult(action=action, error="request_journaling: missing goal_id")
+        goal = self._db.get_goal(goal_id)
+        if not goal:
+            return ActionResult(action=action, error=f"request_journaling: goal {goal_id!r} not found")
+        log.info("Journaling requested for goal %s", goal_id)
+        return ActionResult(action=action, journaling_requested_for=goal_id)
+
+    def _write_knowledge(self, action: ExecutiveAction) -> ActionResult:
+        params = action.params
+        topic = str(params.get("topic", "")).strip()
+        content = str(params.get("content", "")).strip()
+
+        if not topic:
+            return ActionResult(action=action, error="write_knowledge: missing topic")
+        if not content:
+            return ActionResult(action=action, error="write_knowledge: missing content")
+
+        # Extract first meaningful line as summary
+        summary_line = next(
+            (
+                line.strip()
+                for line in content.splitlines()
+                if line.strip() and not line.startswith("#")
+            ),
+            "",
+        )[:120]
+
+        current_tick = self._db.get_last_tick_id()
+        self._db.upsert_knowledge(
+            topic=topic,
+            content=content,
+            summary=summary_line,
+            tick=current_tick,
+        )
+        log.info("Executive wrote knowledge: topic=%r (%d chars)", topic, len(content))
+        return ActionResult(action=action)
+
+    def _forget_knowledge(self, action: ExecutiveAction) -> ActionResult:
+        topic = str(action.params.get("topic", "")).strip()
+        if not topic:
+            return ActionResult(action=action, error="forget_knowledge: missing topic")
+
+        deleted = self._db.delete_knowledge(topic)
+        if deleted:
+            log.info("Executive deleted knowledge: topic=%r", topic)
+        else:
+            log.warning("forget_knowledge: topic %r not found", topic)
+            return ActionResult(action=action, error=f"forget_knowledge: topic {topic!r} not found")
+        return ActionResult(action=action)

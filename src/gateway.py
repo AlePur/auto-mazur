@@ -21,8 +21,6 @@ Observe
   GET /ticks?n=50&goal_id=X              recent ticks
   GET /knowledge                          knowledge index
   GET /knowledge/{topic}                  knowledge markdown content
-  GET /reflections?n=10                   recent reflection index entries
-  GET /reflections/{tick}                 reflection markdown content
   GET /weeklies?n=5                       recent weekly-summary index entries
   GET /weeklies/{tick}                    weekly-summary markdown content
   GET /outbox?n=20                        recent outbox messages
@@ -311,34 +309,6 @@ class _Handler(BaseHTTPRequestHandler):
             #   }
             return {"topic": topic, "content": content}
 
-        # /reflections
-        if path == "/reflections":
-            # Response: [ReflectionEntry, ...]  oldest-first within the returned window
-            # Each ReflectionEntry:
-            #   {
-            #     "tick":           int,
-            #     "trigger_reason": str,  -- why a reflection was triggered
-            #     "file_path":      str,  -- relative to workspace root
-            #     "summary":        str   -- first non-empty line of observations
-            #   }
-            n = _int_qs(qs, "n", 10)
-            return db.get_recent_reflections(n=n)
-
-        if path.startswith("/reflections/"):
-            tick_str = path[len("/reflections/"):]
-            entries = db.get_recent_reflections(n=10_000)
-            entry = next((e for e in entries if str(e["tick"]) == tick_str), None)
-            if not entry:
-                raise _NotFound(f"reflection tick={tick_str} not found")
-            content = store.read_reflection_file(entry["file_path"])
-            # Response:
-            #   {
-            #     "tick":    int,
-            #     "content": str  -- raw Markdown of the reflection file;
-            #                        "" if file is missing on disk
-            #   }
-            return {"tick": entry["tick"], "content": content or ""}
-
         # /weeklies
         if path == "/weeklies":
             # Response: [WeeklyEntry, ...]  oldest-first within the returned window
@@ -455,7 +425,7 @@ class _Handler(BaseHTTPRequestHandler):
             # Each LLMEntry:
             #   {
             #     "ts":         float,        -- Unix timestamp of the call
-            #     "actor":      str,          -- "executive" | "worker" | "reflector" | "summarizer"
+            #     "actor":      str,          -- "executive" | "worker" | "summarizer"
             #     "tick_id":    int | null,
             #     "session_id": int | null,
             #     "goal_id":    str | null,
@@ -663,8 +633,8 @@ def _tick_dict(tick: Any) -> dict:
             "tick_id":     int,
             "session_id":  int | null,  -- null for executive / infra ticks
             "goal_id":     str | null,  -- null for infra ticks
-            "actor":       str,         -- "executive" | "worker" | "reflector" | "summarizer" | "infra"
-            "action_type": str,         -- e.g. "shell", "write", "decision", "reflect", "journal"
+            "actor":       str,         -- "executive" | "worker" | "summarizer" | "infra"
+            "action_type": str,         -- e.g. "shell", "write", "decision", "journal"
             "summary":     str,         -- one-line description of what happened
             "outcome":     str          -- "ok" | "error"
         }
