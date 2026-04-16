@@ -280,6 +280,12 @@ class ExecutiveTick:
                     return "[read_file: path is required]"
                 return self._read_workspace_file(path_str, lines_arg)
 
+            case "list_files":
+                path_str = str(args.get("path", "")).strip()
+                if not path_str:
+                    return "[list_files: path is required]"
+                return self._list_workspace_files(path_str)
+
             case _:
                 return f"[unknown query tool: {name!r}]"
 
@@ -343,6 +349,45 @@ class ExecutiveTick:
             f"Showing lines {showing}{truncated_note}]\n"
         )
         return header + text
+
+    def _list_workspace_files(self, path_str: str) -> str:
+        """
+        List the immediate contents of a directory as the worker user.
+        Directories are indicated with a trailing '/'.
+        """
+        p = Path(path_str)
+        if not p.is_absolute():
+            p = self._workspace.root / p
+
+        worker_user = self._config.worker_user
+        if worker_user:
+            cmd = ["sudo", "-n", "-u", worker_user, "ls", "-1", "--", str(p)]
+        else:
+            cmd = ["ls", "-1", "--", str(p)]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode(errors="replace").strip()
+                if "No such file" in stderr or "cannot access" in stderr.lower():
+                    return f"[DIRECTORY NOT FOUND: {p}]"
+                if "Permission denied" in stderr:
+                    return f"[PERMISSION DENIED: {p}]"
+                return f"[ERROR listing {p}: {stderr}]"
+            names = proc.stdout.decode(errors="replace").splitlines()
+        except subprocess.TimeoutExpired:
+            return f"[TIMEOUT listing {p}]"
+        except Exception as exc:
+            return f"[ERROR listing {p}: {exc}]"
+
+        # Mark directories with trailing '/'
+        annotated: list[str] = []
+        for name in names:
+            entry = p / name
+            annotated.append(name + "/" if entry.is_dir() else name)
+
+        header = f"[Directory: {p} | {len(annotated)} item(s)]\n"
+        return header + "\n".join(annotated)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

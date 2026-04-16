@@ -35,6 +35,7 @@ EXEC_QUERY_READ_KNOWLEDGE    = "read_knowledge"
 EXEC_QUERY_SEARCH_KNOWLEDGE  = "search_knowledge"
 EXEC_QUERY_LIST_SESSIONS     = "list_sessions"
 EXEC_QUERY_READ_FILE         = "read_file"
+EXEC_QUERY_LIST_FILES        = "list_files"
 
 EXEC_QUERY_TOOLS = {
     EXEC_QUERY_READ_JOURNAL,
@@ -42,6 +43,7 @@ EXEC_QUERY_TOOLS = {
     EXEC_QUERY_SEARCH_KNOWLEDGE,
     EXEC_QUERY_LIST_SESSIONS,
     EXEC_QUERY_READ_FILE,
+    EXEC_QUERY_LIST_FILES,
 }
 
 # ── System prompt ─────────────────────────────────────────────────────────
@@ -99,7 +101,12 @@ QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Keyword query to search for.",
+                        "description": (
+                            "SQLite FTS5 query string. Supports keywords, boolean operators "
+                            "(AND, OR, NOT), phrase search (\"exact phrase\"), prefix wildcards "
+                            "(term*), and column filters (topic:term). "
+                            "Example: 'nginx AND ssl', '\"access control\"', 'internet access cli'."
+                        ),
                     }
                 },
                 "required": ["query"],
@@ -152,6 +159,27 @@ QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "Format: 'START-END', e.g. '0-100', '200-300'. "
                             "Omit for default first 100 lines."
                         ),
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "List the immediate contents of a directory in the workspace. "
+                "Returns one entry per line; directories are marked with a trailing '/'. "
+                "Paths are relative to the workspace root or absolute."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the directory (relative to workspace root or absolute).",
                     },
                 },
                 "required": ["path"],

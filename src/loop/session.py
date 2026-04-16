@@ -146,6 +146,7 @@ class WorkerSession:
                         summary=f"finish({status}): {summary[:120]}",
                         outcome=OUTCOME_OK,
                     )
+                    self._write_checkpoint(summary)
                     return self._end_session(
                         tick_id=tick_id,
                         status=status,
@@ -346,6 +347,26 @@ class WorkerSession:
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _write_checkpoint(self, summary: str) -> None:
+        """Write a checkpoint immediately when the worker calls finish()."""
+        try:
+            prev = self._store.read_checkpoint(self._goal.workspace_path)
+            messages = sum_char.checkpoint_prompt(
+                task_description=self._task.description,
+                session_summary=summary,
+                previous_checkpoint=prev,
+            )
+            self._llm.set_call_context(
+                actor=ACTOR_WORKER,
+                session_id=self._session_id,
+                goal_id=self._goal.goal_id,
+            )
+            new_content = (self._llm.chat(messages, temperature=0.3).content or "")
+            self._store.write_checkpoint(self._goal.workspace_path, new_content)
+            log.info("Checkpoint written on finish for %s", self._goal.goal_id)
+        except Exception as exc:
+            log.warning("Failed to write checkpoint on finish for %s: %s", self._goal.goal_id, exc)
 
     def _log_tick(
         self, tick_id: int, action_type: str, summary: str, outcome: str

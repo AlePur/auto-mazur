@@ -27,7 +27,7 @@ _SOULS = Path(__file__).parent.parent / "souls"
 _JOURNAL_SYSTEM = (_SOULS / "summarizer-journal.md").read_text()
 
 # Caps for journal context
-_MAX_JOURNAL_PREV_CHARS = 600   # chars per previous journal entry shown
+_MAX_JOURNAL_PREV_CHARS = 1000   # chars per previous journal entry shown
 _MAX_SESSION_SUMMARY_CHARS = 300  # chars per session summary shown
 
 
