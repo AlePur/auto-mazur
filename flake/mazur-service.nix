@@ -47,7 +47,7 @@ let
     context_compress_threshold_tokens: 0   # auto: 60% of context_length_tokens
 
     # Executive
-    max_executive_queries: 10
+    max_executive_queries: 20
 
     # Task loop
     max_task_attempts: 3
