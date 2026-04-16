@@ -35,7 +35,7 @@ let
     worker_user: "mazur-worker"
 
     # Tool limits
-    command_timeout_seconds: 300
+    command_timeout_seconds: 120
     max_output_bytes:        102400
     max_read_bytes:          102400
     max_read_chars:          30000
