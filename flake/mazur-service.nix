@@ -52,13 +52,6 @@ let
     # Task loop
     max_task_attempts: 3
 
-    # Consolidation schedule (ticks)
-    checkpoint_interval:      50
-    journal_interval:         500
-    reflection_interval:      2000
-    weekly_summary_interval:  5000
-    archive_interval:         50000
-
     # Health checks
     stuck_detection_window:   5
     failure_streak_threshold: 10

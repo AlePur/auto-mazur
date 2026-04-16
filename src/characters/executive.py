@@ -133,7 +133,7 @@ QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "read_file",
             "description": (
                 "Read a file from the workspace. "
-                "Paths are relative to the workspace root (e.g. 'goals/goal-001-slug/src/main.py'). "
+                "Paths are relative to your workspace root, which may be different from the Worker's workspace. "
                 "Absolute paths are also accepted. "
                 "By default returns the first 100 lines. "
                 "Use the `lines` parameter to read a specific range, e.g. '100-200'."

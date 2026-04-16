@@ -182,7 +182,7 @@ class Consolidation:
     ) -> bool:
         """Write a journal entry for the goal. Returns True on success."""
         # Gather last 50 ticks for the goal
-        ticks = self._db.get_recent_ticks(n=50, goal_id=goal_id)
+        ticks = self._db.get_recent_ticks(n=100, goal_id=goal_id)
         if not ticks and not force:
             return False
 
