@@ -293,6 +293,18 @@ class PersistentShell:
             ready, _, _ = select.select([self._proc.stdout], [], [], remaining)
             if not ready:
                 timed_out = True
+                # Kill and restart the shell so stale output from this timed-out
+                # command cannot bleed into the next run() call.  The sentinel
+                # for *this* command is still sitting in the pipe buffer; if we
+                # left the process alive, the next run() would read those stale
+                # lines and mistake them for the new command's output.
+                try:
+                    self._proc.kill()
+                    self._proc.wait(timeout=3)
+                except Exception:
+                    pass
+                self._proc = None
+                self._start()
                 break
 
             line = self._proc.stdout.readline()
