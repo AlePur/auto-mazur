@@ -286,6 +286,21 @@ class ExecutiveTick:
                     return "[list_files: path is required]"
                 return self._list_workspace_files(path_str)
 
+            case "get_message_replies":
+                msg_id = str(args.get("message_id", "")).strip()
+                if not msg_id:
+                    return "[get_message_replies: message_id is required]"
+                replies = self._db.get_replies_for_message(msg_id)
+                if not replies:
+                    return f"(no replies found for message {msg_id!r})"
+                import time as _time
+                lines = [f"Replies for inbox message {msg_id!r} ({len(replies)} total):"]
+                for r in replies:
+                    import datetime as _dt
+                    ts = _dt.datetime.fromtimestamp(r["sent_at"]).strftime("%Y-%m-%d %H:%M")
+                    lines.append(f"\n### {r['title']} (sent {ts})\n{r['content']}")
+                return "\n".join(lines)
+
             case _:
                 return f"[unknown query tool: {name!r}]"
 

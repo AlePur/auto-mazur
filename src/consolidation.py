@@ -82,8 +82,8 @@ class Consolidation:
 
     def journal_goal(self, goal_id: str, current_tick: int) -> bool:
         """
-        Explicitly write a journal entry for a goal (called by Executive's
-        request_journaling action).  Returns True if successful.
+        Explicitly write a journal entry for a goal.
+        Returns True if successful.
         """
         goal = self._db.get_goal(goal_id)
         if not goal:

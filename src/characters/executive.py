@@ -30,12 +30,13 @@ log = logging.getLogger(__name__)
 # ── Tool name constants ────────────────────────────────────────────────────
 
 # Query tools (read-only, no state mutation)
-EXEC_QUERY_READ_JOURNAL      = "read_journal"
-EXEC_QUERY_READ_KNOWLEDGE    = "read_knowledge"
-EXEC_QUERY_SEARCH_KNOWLEDGE  = "search_knowledge"
-EXEC_QUERY_LIST_SESSIONS     = "list_sessions"
-EXEC_QUERY_READ_FILE         = "read_file"
-EXEC_QUERY_LIST_FILES        = "list_files"
+EXEC_QUERY_READ_JOURNAL        = "read_journal"
+EXEC_QUERY_READ_KNOWLEDGE      = "read_knowledge"
+EXEC_QUERY_SEARCH_KNOWLEDGE    = "search_knowledge"
+EXEC_QUERY_LIST_SESSIONS       = "list_sessions"
+EXEC_QUERY_READ_FILE           = "read_file"
+EXEC_QUERY_LIST_FILES          = "list_files"
+EXEC_QUERY_GET_MESSAGE_REPLIES = "get_message_replies"
 
 EXEC_QUERY_TOOLS = {
     EXEC_QUERY_READ_JOURNAL,
@@ -44,6 +45,7 @@ EXEC_QUERY_TOOLS = {
     EXEC_QUERY_LIST_SESSIONS,
     EXEC_QUERY_READ_FILE,
     EXEC_QUERY_LIST_FILES,
+    EXEC_QUERY_GET_MESSAGE_REPLIES,
 }
 
 # ── System prompt ─────────────────────────────────────────────────────────
@@ -183,6 +185,27 @@ QUERY_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_message_replies",
+            "description": (
+                "Look up all outbox replies that were sent in response to a specific inbox message. "
+                "Use this to see what you have already told the user about a particular message "
+                "before deciding how to follow up."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "The inbox msg_id to look up replies for.",
+                    },
+                },
+                "required": ["message_id"],
             },
         },
     },
@@ -327,28 +350,6 @@ ACTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["title", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "request_journaling",
-            "description": (
-                "Request the Summarizer to write a journal entry for a goal. "
-                "Use this after a productive run of sessions, when you want to "
-                "capture progress before the goal's automatic journal threshold is reached, "
-                "or before a long break from working on a goal."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "goal_id": {
-                        "type": "string",
-                        "description": "ID of the goal to journal.",
-                    }
-                },
-                "required": ["goal_id"],
             },
         },
     },

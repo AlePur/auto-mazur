@@ -722,6 +722,16 @@ class Database:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def get_replies_for_message(self, msg_id: str) -> list[dict]:
+        """Return all outbox entries that are replies to the given inbox msg_id, oldest first."""
+        with self._cursor() as cur:
+            rows = cur.execute(
+                "SELECT msg_id, reply_to, title, content, sent_at FROM outbox "
+                "WHERE reply_to = ? ORDER BY sent_at ASC",
+                (msg_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
 
 # ── Private helpers ────────────────────────────────────────────────────────
 

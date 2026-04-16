@@ -174,7 +174,6 @@ class MainLoop:
 
         # 4. Execute actions
         task_to_run: Task | None = None
-        journaling_goals: list[str] = []
 
         for action_result in (self._action_executor.execute(a) for a in actions):
             if action_result.error:
@@ -192,9 +191,6 @@ class MainLoop:
                         "subsequent tasks will be re-assigned next tick"
                     )
 
-            if action_result.journaling_requested_for:
-                journaling_goals.append(action_result.journaling_requested_for)
-
             if action_result.outbox_entry:
                 self._deliver_outbox(action_result.outbox_entry)
 
@@ -208,14 +204,7 @@ class MainLoop:
         else:
             self._last_result = None
 
-        # 6. On-demand journaling requested by Executive
-        for goal_id in journaling_goals:
-            try:
-                self._consolidation.journal_goal(goal_id, tick)
-            except Exception as exc:
-                log.error("journal_goal(%r) failed: %s", goal_id, exc)
-
-        # 7. Advance tick counter
+        # 6. Advance tick counter
         self._tick = tick + 1
 
     # ── Worker session runner ──────────────────────────────────────────────
